@@ -1,0 +1,69 @@
+<section x-data="settingsPage()" x-init="load()">
+  <h1>Settings</h1>
+  <p>Store the Gemini API key encrypted in the local SQLite database and manage the extraction instructions used for new transcriptions.</p>
+  <div class="card">
+    <h2>Gemini API</h2>
+    <p class="notice" x-text="keyState">Checking saved API key…</p>
+    <label>Google Gemini API key
+      <input type="password" autocomplete="new-password" x-model="apiKey" placeholder="Leave blank to keep the current key">
+    </label>
+    <div class="row">
+      <button type="button" @click="testKey()">Test key</button>
+      <button type="button" class="secondary" @click="save()">Save settings</button>
+    </div>
+    <p class="muted" x-show="message" x-text="message"></p>
+  </div>
+  <div class="card">
+    <h2>Transcription system prompt</h2>
+    <p class="muted">The default directive requests exhaustive extraction and structured YAML frontmatter. Custom instructions should preserve those output requirements.</p>
+    <label>Prompt
+      <textarea x-model="systemPrompt" rows="14"></textarea>
+    </label>
+    <button type="button" @click="save()">Save prompt and settings</button>
+  </div>
+</section>
+<script>
+function settingsPage() {
+  return {
+    apiKey: "",
+    systemPrompt: "",
+    keyState: "",
+    message: "",
+    async load() {
+      try {
+        const response = await fetch("/api/settings");
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || "Could not load settings");
+        this.keyState = data.has_api_key ? "An API key is configured. It is never returned to the browser." : "No API key is configured.";
+        this.systemPrompt = data.system_prompt;
+      } catch (error) { this.message = error.message; }
+    },
+    async save() {
+      this.message = "Saving…";
+      try {
+        const response = await fetch("/api/settings", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ api_key: this.apiKey, system_prompt: this.systemPrompt })
+        });
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || "Save failed");
+        this.apiKey = "";
+        this.keyState = "Settings saved. An API key is never returned to the browser.";
+        this.message = "Settings saved.";
+      } catch (error) { this.message = error.message; }
+    },
+    async testKey() {
+      this.message = "Testing API key…";
+      try {
+        const response = await fetch("/api/settings/test", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ api_key: this.apiKey })
+        });
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || "API key test failed");
+        this.message = data.message;
+      } catch (error) { this.message = error.message; }
+    }
+  };
+}
+</script>

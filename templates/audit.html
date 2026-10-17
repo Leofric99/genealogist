@@ -1,0 +1,85 @@
+<section x-data="auditPage()">
+  <h1>GEDCOM research audit</h1>
+  <p>Upload a family tree to check transcribed evidence for timeline, identity, and possible location conflicts.</p>
+  <div class="card">
+    <h2>Family tree</h2>
+    <form @submit.prevent="upload()">
+      <label>GEDCOM file (.ged)
+        <input type="file" accept=".ged,.gedcom,text/plain" x-ref="gedcom" required>
+      </label>
+      <button type="submit" :disabled="busy">Upload family tree</button>
+    </form>
+    <p class="muted" x-text="uploadMessage"></p>
+  </div>
+  <div class="card">
+    <h2>Anomaly report</h2>
+    <button type="button" @click="audit()" :disabled="busy">Run audit and generate report</button>
+    <p class="muted" x-text="message"></p>
+    <div x-show="result">
+      <p><strong x-text="anomalyCount"></strong> potential issue(s)</p>
+      <pre class="notice" x-text="result"></pre>
+    </div>
+  </div>
+  <div class="card">
+    <h2>Life story biography</h2>
+    <p class="muted">Enter a GEDCOM individual identifier (for example, @I12@). Generated claims must cite matching transcript files.</p>
+    <form @submit.prevent="story()">
+      <label>Individual ID
+        <input type="text" x-model="personId" placeholder="@I12@" required>
+      </label>
+      <label>Output location
+        <select x-model="destination">
+          <option value="central">Central stories directory</option>
+          <option value="person">Individual subfolder</option>
+        </select>
+      </label>
+      <button type="submit" :disabled="busy">Generate biography</button>
+    </form>
+    <p class="muted" x-text="storyMessage"></p>
+  </div>
+</section>
+<script>
+function auditPage() {
+  return {
+    busy: false, uploadMessage: "", message: "", result: "", anomalyCount: 0,
+    personId: "", destination: "central", storyMessage: "",
+    async upload() {
+      this.busy = true; this.uploadMessage = "Uploading…";
+      try {
+        const form = new FormData();
+        form.append("gedcom", this.$refs.gedcom.files[0]);
+        const response = await fetch("/api/gedcom", { method: "POST", body: form });
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || "Upload failed");
+        this.uploadMessage = `Loaded ${data.people} individuals.`;
+      } catch (error) { this.uploadMessage = error.message; }
+      finally { this.busy = false; }
+    },
+    async audit() {
+      this.busy = true; this.message = "Checking records and asking Gemini for a narrative…";
+      try {
+        const response = await fetch("/api/audit", { method: "POST" });
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || "Audit failed");
+        this.anomalyCount = data.anomalies.length;
+        this.result = data.report;
+        this.message = `Report saved to ${data.report_path}`;
+      } catch (error) { this.message = error.message; }
+      finally { this.busy = false; }
+    },
+    async story() {
+      this.busy = true; this.storyMessage = "Generating cited biography…";
+      try {
+        const response = await fetch(`/api/story/${encodeURIComponent(this.personId)}`, {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ destination: this.destination })
+        });
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || "Biography generation failed");
+        this.storyMessage = `Saved to ${data.path} using ${data.sources} transcript source(s).`;
+      } catch (error) { this.storyMessage = error.message; }
+      finally { this.busy = false; }
+    }
+  };
+}
+</script>

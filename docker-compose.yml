@@ -1,0 +1,19 @@
+services:
+  genealogy-ocr-studio:
+    build: .
+    container_name: genealogy-ocr-studio
+    ports:
+      - "127.0.0.1:3000:3000"
+    environment:
+      DATABASE_PATH: /app/data/genealogy.sqlite3
+      RECORDS_DIR: /data/records
+      OUTPUT_DIR: /data/output
+      BIND_ADDR: 0.0.0.0:3000
+      # Optional; alternatively configure the key in the web Settings page.
+      # GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+    volumes:
+      - ./data:/app/data
+      # Replace ./research with the host folder containing your genealogy files.
+      - ./research:/data/records
+      - ./output:/data/output
+    restart: unless-stopped
