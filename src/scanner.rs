@@ -18,6 +18,12 @@ pub struct ScannedFile {
 }
 
 pub fn is_supported(path: &Path) -> bool {
+    if path
+        .file_name()
+        .is_some_and(|name| name.to_string_lossy().starts_with('.'))
+    {
+        return false;
+    }
     path.extension()
         .and_then(|ext| ext.to_str())
         .map(|ext| {
@@ -51,7 +57,13 @@ fn scan_and_hash_inner(
         );
     }
     let mut paths = Vec::new();
-    for entry in WalkDir::new(root).follow_links(false) {
+    for entry in WalkDir::new(root)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|entry| {
+            entry.depth() == 0 || !entry.file_name().to_string_lossy().starts_with('.')
+        })
+    {
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
             return Ok(None);
         }
@@ -109,7 +121,9 @@ fn hash_file_inner(
 
 #[cfg(test)]
 mod tests {
-    use super::scan_and_hash_cancellable;
+    use super::{is_supported, scan_and_hash, scan_and_hash_cancellable};
+    use std::fs;
+    use std::path::Path;
     use tokio_util::sync::CancellationToken;
 
     #[test]
@@ -121,5 +135,23 @@ mod tests {
         assert!(scan_and_hash_cancellable(directory.path(), &cancellation)
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn scan_skips_dotfiles_and_hidden_directories() {
+        let directory = tempfile::tempdir().unwrap();
+        let hidden_directory = directory.path().join(".metadata");
+        fs::create_dir(&hidden_directory).unwrap();
+        fs::write(directory.path().join("visible.png"), b"visible").unwrap();
+        fs::write(directory.path().join("._metadata.png"), b"sidecar").unwrap();
+        fs::write(hidden_directory.join("inside.png"), b"hidden").unwrap();
+
+        let files = scan_and_hash(directory.path()).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(
+            files[0].path.file_name().and_then(|name| name.to_str()),
+            Some("visible.png")
+        );
+        assert!(!is_supported(Path::new(".hidden.pdf")));
     }
 }

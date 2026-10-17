@@ -35,9 +35,7 @@ impl AuthManager {
         if username.trim().is_empty() || username.len() > 128 {
             anyhow::bail!("GOS_USERNAME must contain between 1 and 128 characters");
         }
-        if password.len() < 16 || password.len() > 4096 {
-            anyhow::bail!("GOS_PASSWORD must contain between 16 and 4096 characters");
-        }
+        validate_password(password)?;
         let digest = Sha256::digest(password.as_bytes());
         let mut password_hash = [0_u8; 32];
         password_hash.copy_from_slice(&digest);
@@ -116,6 +114,28 @@ impl AuthManager {
     }
 }
 
+fn validate_password(password: &str) -> Result<()> {
+    if password.len() > 4096 {
+        anyhow::bail!("GOS_PASSWORD must not exceed 4096 bytes");
+    }
+    let characters = password.chars().collect::<Vec<_>>();
+    if characters.len() < 10
+        || !characters.iter().any(|character| character.is_uppercase())
+        || !characters.iter().any(|character| character.is_lowercase())
+        || !characters
+            .iter()
+            .any(|character| character.is_ascii_digit())
+        || !characters
+            .iter()
+            .any(|character| !character.is_alphanumeric() && !character.is_whitespace())
+    {
+        anyhow::bail!(
+            "GOS_PASSWORD must be at least 10 characters and include an uppercase letter, a lowercase letter, a number, and a symbol"
+        );
+    }
+    Ok(())
+}
+
 fn fingerprint(token: &[u8]) -> [u8; 32] {
     let digest = Sha256::digest(token);
     let mut result = [0_u8; 32];
@@ -125,18 +145,28 @@ fn fingerprint(token: &[u8]) -> [u8; 32] {
 
 #[cfg(test)]
 mod tests {
-    use super::AuthManager;
+    use super::{validate_password, AuthManager};
+
+    #[test]
+    fn password_requires_length_and_each_character_class() {
+        assert!(validate_password("GoodPassword1!").is_ok());
+        assert!(validate_password("aA1!short").is_err());
+        assert!(validate_password("lowercase123!").is_err());
+        assert!(validate_password("UPPERCASE123!").is_err());
+        assert!(validate_password("GoodPassword!!").is_err());
+        assert!(validate_password("GoodPassword1").is_err());
+    }
 
     #[tokio::test]
     async fn session_requires_credentials_and_expires_on_logout() {
-        let auth = AuthManager::new("researcher".to_owned(), "a-strong-password-123").unwrap();
+        let auth = AuthManager::new("researcher".to_owned(), "A-strong-password-123").unwrap();
         assert!(auth
-            .authenticate("researcher", "wrong-password-1234")
+            .authenticate("researcher", "Wrong-password-1234")
             .await
             .unwrap()
             .is_none());
         let session = auth
-            .authenticate("researcher", "a-strong-password-123")
+            .authenticate("researcher", "A-strong-password-123")
             .await
             .unwrap()
             .expect("valid credentials create a session");

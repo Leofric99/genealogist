@@ -881,7 +881,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "genealogy-ocr-studio"
+name = "genesleuth"
 version = "0.1.0"
 dependencies = [
  "anyhow",

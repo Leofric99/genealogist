@@ -1,8 +1,8 @@
 [package]
-name = "genealogy-ocr-studio"
+name = "genesleuth"
 version = "0.1.0"
 edition = "2021"
-description = "Local-first genealogy document transcription and research auditing"
+description = "GeneSleuth: local-first genealogy document transcription and research auditing"
 
 [dependencies]
 anyhow = "1"

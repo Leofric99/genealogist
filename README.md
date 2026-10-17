@@ -1,4 +1,4 @@
-# Genealogy-OCR-Studio
+# GeneSleuth
 
 A local-first Rust application for indexing genealogy records, transcribing
 images and PDFs with Gemini, comparing extracted facts to GEDCOM, and creating
@@ -10,13 +10,14 @@ Install Rust, then run:
 
 ```powershell
 $env:GOS_USERNAME = "researcher"
-$env:GOS_PASSWORD = "replace-this-with-a-long-random-password"
+$env:GOS_PASSWORD = "replace-with-10-plus-chars-including-Aa1!"
 cargo run -- serve
 ```
 
 The web interface listens at `http://127.0.0.1:3000` by default and requires
-the configured username and password. Use a unique password of at least 16
-characters. Configure an API key in Settings or set `GEMINI_API_KEY`.
+the configured username and password. Use a unique password with at least 10
+characters, including an uppercase letter, a lowercase letter, a number, and a
+symbol. Configure an API key in Settings or set `GEMINI_API_KEY`.
 The default indexed folder is `/data/records`; set `RECORDS_DIR` to a local
 folder on Windows.
 
@@ -37,7 +38,7 @@ Edit `docker-compose.yml` to set the host research directory, then:
 
 ```powershell
 Copy-Item .env.example .env
-# Edit .env and set GOS_USERNAME and a unique GOS_PASSWORD (at least 16 chars).
+# Edit .env and set GOS_USERNAME and a unique GOS_PASSWORD meeting the rules above.
 docker compose up --build
 ```
 
@@ -48,7 +49,7 @@ IPv4 address (for example `192.168.0.3`), then start or recreate the service:
 ```dotenv
 HOST_BIND_IP=192.168.0.3
 GOS_USERNAME=researcher
-GOS_PASSWORD=use-a-unique-random-password-of-32-chars-or-more
+GOS_PASSWORD=use-a-unique-password-like-Aa1-with-10-or-more-chars
 ```
 
 Open `http://192.168.0.3:3000` from the other device and sign in. Allow inbound
@@ -63,6 +64,24 @@ generated stories at `/data/output`. Database/settings are stored in a Docker
 named volume mounted at `/app/data`, avoiding host bind-mount ownership errors.
 That volume persists across `docker compose down`; do not use `docker compose
 down -v` unless you intend to delete the database and encryption key.
+
+### Reset GeneSleuth as a new user
+
+To remove the saved database, API-key settings, and encryption key before
+rebuilding, run this from the directory containing `docker-compose.yml`:
+
+```powershell
+docker compose down --volumes
+# Update GOS_USERNAME and GOS_PASSWORD in .env for the new user.
+docker compose up --build -d
+```
+
+`down --volumes` deletes the Compose named volume containing `/app/data`.
+GeneSleuth will create a fresh database and encryption key on startup. This
+does **not** delete the host research folder, source files, sidecar transcripts,
+or the `./output` folder because those are bind-mounted directories. The reset
+also removes any other Compose-managed named volumes for this project; this
+Compose setup currently uses `app-data` for persistent application data.
 Browse to `http://localhost:3000` when using the default localhost-only binding.
 On Linux, set `PUID` and `PGID` to the owner IDs of the mounted research/output
 directories before building. Defaults are `1000:1000`:
@@ -90,5 +109,12 @@ PUID=$(id -u) PGID=$(id -g) docker compose up --build
 - An in-progress directory scan can be stopped from the dashboard. The stop
   action cancels the current async processing operation and stops hashing
   discovered files; already completed transcripts remain saved.
+- Dot-prefixed files and directories are excluded from scans. Use **Clear
+  indexed files** on the dashboard to reset the SQLite file index; this preserves
+  source documents and all transcripts. Existing transcripts will still be
+  detected and skipped during a subsequent scan.
+- The dashboard's **Live activity** feed shows timestamped scan and Gemini
+  request events. The latest 100 events are retained in memory for reconnecting
+  browser sessions; persisted job progress remains available from SQLite.
 - Geographical anomaly checks are conservative string/date heuristics, not
   geocoding. Review flagged items manually.

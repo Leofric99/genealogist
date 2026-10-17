@@ -32,7 +32,7 @@ use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
 #[command(
-    name = "genealogy-ocr-studio",
+    name = "genesleuth",
     version,
     about = "Genealogy document OCR, indexing, and research auditing"
 )]
@@ -98,6 +98,7 @@ fn build_state(
             gemini,
             queue_tx,
             progress_tx,
+            activity_log: std::sync::Mutex::new(std::collections::VecDeque::new()),
             scan_cancellation: std::sync::Mutex::new(CancellationToken::new()),
         }),
         queue_rx,
@@ -130,6 +131,7 @@ async fn serve() -> Result<()> {
         .route("/api/status", get(web::handlers::status))
         .route("/api/scan", post(web::handlers::start_scan))
         .route("/api/scan/stop", post(web::handlers::stop_scan))
+        .route("/api/index/clear", post(web::handlers::clear_index))
         .route(
             "/api/settings",
             get(web::handlers::get_settings).post(web::handlers::save_settings),
@@ -148,7 +150,7 @@ async fn serve() -> Result<()> {
     let listener = tokio::net::TcpListener::bind(&bind_addr)
         .await
         .with_context(|| format!("binding web server at {bind_addr}"))?;
-    tracing::info!(%bind_addr, "Genealogy-OCR-Studio is ready");
+    tracing::info!(%bind_addr, "GeneSleuth is ready");
     axum::serve(listener, app).await?;
     Ok(())
 }

@@ -209,4 +209,71 @@ impl Database {
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
+
+    pub fn clear_file_index(&self) -> Result<bool> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        let running: bool =
+            transaction.query_row("SELECT running FROM job WHERE id=1", [], |row| row.get(0))?;
+        if running {
+            return Ok(false);
+        }
+        transaction.execute("DELETE FROM files", [])?;
+        transaction.execute(
+            "UPDATE job SET total=0, processed=0, skipped=0, active=NULL,
+             message='Indexed files cleared; transcripts were preserved' WHERE id=1",
+            [],
+        )?;
+        transaction.commit()?;
+        Ok(true)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Database;
+
+    #[test]
+    fn clear_file_index_preserves_settings_and_transcripts_and_rejects_running_jobs() {
+        let directory = tempfile::tempdir().expect("temporary database directory");
+        let database =
+            Database::open(&directory.path().join("genealogy.sqlite3")).expect("open database");
+        let transcript = directory.path().join("record.md");
+        std::fs::write(&transcript, "existing transcript").expect("write transcript");
+        database
+            .set_setting("system_prompt", "custom prompt")
+            .expect("save setting");
+        database
+            .save_file(
+                "record.png",
+                "abc123",
+                "transcribed",
+                transcript.to_str(),
+                None,
+            )
+            .expect("save indexed file");
+
+        assert!(database.begin_job().expect("begin job"));
+        assert!(!database.clear_file_index().expect("reject active job"));
+        assert_eq!(database.file_statuses().expect("read files").len(), 1);
+
+        database.finish_job(Some("complete")).expect("finish job");
+        assert!(database.clear_file_index().expect("clear index"));
+        assert!(database
+            .file_statuses()
+            .expect("read cleared files")
+            .is_empty());
+        assert_eq!(
+            database.setting("system_prompt").expect("read setting"),
+            Some("custom prompt".to_owned())
+        );
+        assert_eq!(
+            std::fs::read_to_string(transcript).expect("read transcript"),
+            "existing transcript"
+        );
+        let status = database.job_status().expect("read job status");
+        assert_eq!(status.total, 0);
+        assert_eq!(status.processed, 0);
+        assert_eq!(status.skipped, 0);
+    }
 }

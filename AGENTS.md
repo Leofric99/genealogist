@@ -1,4 +1,4 @@
-# Genealogy-OCR-Studio: AI contributor notes
+# GeneSleuth: AI contributor notes
 
 ## Architecture
 
@@ -14,7 +14,12 @@
   `GOS_MASTER_KEY` key stability or the local `.encryption-key` file when
   persisting the database.
 - Queue progress is broadcast to WebSocket clients and can be recovered from
-  SQLite after a server restart.
+  SQLite after a server restart. The latest 100 timestamped activity events are
+  retained in memory for browser reconnects; keep the WebSocket event envelope
+  (`type: status` or `type: log`) consistent with the dashboard.
+- Hidden dot-prefixed files and directories are excluded from recursive scans.
+  The clear-index operation removes only SQLite file rows and resets counters;
+  it must preserve originals and sidecar transcripts.
 
 ## Operational configuration
 
@@ -27,8 +32,9 @@
 - `GOS_MASTER_KEY` may be a 64-character hexadecimal encryption key. If unset,
   a local key is generated in the database directory.
 - `GOS_USERNAME` and `GOS_PASSWORD` are required to start the web server. The
-  password must be 16-4096 characters. Web sessions are HttpOnly, SameSite=Strict
-  cookies held in memory and expire after 12 hours.
+  password must be at least 10 characters and include uppercase and lowercase
+  letters, a number, and a symbol (maximum 4096 bytes). Web sessions are
+  HttpOnly, SameSite=Strict cookies held in memory and expire after 12 hours.
 - Docker Compose binds to `127.0.0.1` by default. `HOST_BIND_IP` can select a
   host interface, but only use non-loopback bindings on trusted private networks.
   The app uses HTTP; never expose it directly to the public internet.
@@ -50,4 +56,6 @@
   and model-specific.
 - Directory scans use a cancellation token. Keep cancellation checks in
   filesystem traversal/hashing and make processing futures cancellable.
+- Gemini request and scan outcomes should be published to the activity feed;
+  render user-controlled/event text with DOM `textContent` rather than HTML.
 - PDF operations use `lopdf`; always clean temporary page files with RAII.

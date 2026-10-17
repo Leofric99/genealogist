@@ -200,6 +200,24 @@ pub async fn stop_scan(State(state): State<Arc<AppState>>) -> Result<Json<Value>
     }
 }
 
+pub async fn clear_index(State(state): State<Arc<AppState>>) -> Result<Json<Value>, ApiError> {
+    if !state.db.clear_file_index()? {
+        return Err(ApiError(
+            StatusCode::CONFLICT,
+            "Stop the running scan before clearing the index".to_owned(),
+        ));
+    }
+    queue::publish_log(
+        &state,
+        "Cleared the indexed file list; source files and transcripts were preserved",
+    );
+    queue::publish_status(&state).await;
+    Ok(Json(json!({
+        "cleared": true,
+        "message": "Indexed files cleared. Source files and transcripts were preserved."
+    })))
+}
+
 pub async fn get_settings(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<SettingsResponse>, ApiError> {

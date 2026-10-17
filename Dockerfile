@@ -15,7 +15,7 @@ RUN apt-get update \
     && groupadd --gid "${APP_GID}" app \
     && useradd --create-home --uid "${APP_UID}" --gid app app
 WORKDIR /app
-COPY --from=builder /build/target/release/genealogy-ocr-studio /usr/local/bin/genealogy-ocr-studio
+COPY --from=builder /build/target/release/genesleuth /usr/local/bin/genesleuth
 RUN mkdir -p /app/data /data/records /data/output/stories \
     && chown -R app:app /app/data /data
 USER app
@@ -24,5 +24,5 @@ ENV DATABASE_PATH=/app/data/genealogy.sqlite3 \
     OUTPUT_DIR=/data/output \
     BIND_ADDR=0.0.0.0:3000
 EXPOSE 3000
-ENTRYPOINT ["genealogy-ocr-studio"]
+ENTRYPOINT ["genesleuth"]
 CMD ["serve"]

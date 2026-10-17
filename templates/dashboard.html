@@ -5,6 +5,7 @@
     <div class="row">
       <button type="button" @click="startScan()" :disabled="running">Scan records directory</button>
       <button class="danger" type="button" @click="stopScan()" :disabled="!running || stopping">Stop scan</button>
+      <button class="secondary" type="button" @click="clearIndex()" :disabled="running">Clear indexed files</button>
       <span class="muted">Root: <code x-text="recordsRoot"></code></span>
     </div>
     <div id="progress" class="card" hx-get="/partials/status" hx-trigger="load, every 5s" hx-swap="innerHTML" style="margin-bottom:0">
@@ -13,6 +14,11 @@
     </div>
     <p id="connection" class="muted" x-text="connection"></p>
     <p id="message" class="notice" x-show="message" x-text="message"></p>
+  </div>
+  <div class="card">
+    <h2>Live activity</h2>
+    <p id="activity-empty" class="muted">Waiting for activity…</p>
+    <ol id="activity-log" class="activity-log" aria-live="polite"></ol>
   </div>
   <div class="card">
     <h2>Indexed files</h2>
@@ -63,6 +69,17 @@ function dashboard() {
         this.message = error.message;
       }
     },
+    async clearIndex() {
+      if (this.running) return;
+      if (!window.confirm("Clear the indexed file list? This preserves source files and sidecar transcripts; a later scan will recognize existing transcripts and skip them. Continue?")) return;
+      try {
+        const response = await fetch("/api/index/clear", { method: "POST" });
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || "Unable to clear index");
+        this.message = data.message;
+        await this.refresh();
+      } catch (error) { this.message = error.message; }
+    },
     async refresh() {
       try {
         const response = await fetch("/api/status");
@@ -80,7 +97,29 @@ function dashboard() {
       socket.onopen = () => this.connection = "Live progress connected";
       socket.onclose = () => { this.connection = "Live progress disconnected; reconnecting…"; setTimeout(() => this.connect(), 2500); };
       socket.onerror = () => socket.close();
-      socket.onmessage = event => { try { this.updateProgress(JSON.parse(event.data)); } catch (_) {} };
+      socket.onmessage = event => {
+        try {
+          const data = JSON.parse(event.data);
+          if (data.type === "status") this.updateProgress(data.job);
+          else if (data.type === "log") this.addLog(data);
+        } catch (_) {}
+      };
+    },
+    addLog(event) {
+      const list = document.getElementById("activity-log");
+      const empty = document.getElementById("activity-empty");
+      if (!list || !empty) return;
+      empty.hidden = true;
+      const item = document.createElement("li");
+      const timestamp = document.createElement("time");
+      const date = new Date(Number(event.timestamp));
+      timestamp.dateTime = date.toISOString();
+      timestamp.textContent = date.toLocaleString();
+      const message = document.createElement("span");
+      message.textContent = event.message;
+      item.append(timestamp, message);
+      list.prepend(item);
+      while (list.children.length > 100) list.lastElementChild.remove();
     },
     updateProgress(job) {
       this.running = job.running;

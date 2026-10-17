@@ -14,14 +14,29 @@ pub async fn handler(State(state): State<Arc<AppState>>, upgrade: WebSocketUpgra
 }
 
 async fn stream_progress(mut socket: WebSocket, state: Arc<AppState>) {
+    let mut receiver = state.progress_tx.subscribe();
+    let history = match state.activity_log.lock() {
+        Ok(history) => history.iter().cloned().collect::<Vec<_>>(),
+        Err(error) => {
+            tracing::error!(%error, "could not read recent activity log");
+            Vec::new()
+        }
+    };
     if let Ok(status) = queue::progress_snapshot(&state) {
-        if let Ok(payload) = serde_json::to_string(&status) {
+        if let Ok(payload) = serde_json::to_string(&serde_json::json!({
+            "type": "status",
+            "job": status,
+        })) {
             if socket.send(Message::Text(payload.into())).await.is_err() {
                 return;
             }
         }
     }
-    let mut receiver = state.progress_tx.subscribe();
+    for event in history {
+        if socket.send(Message::Text(event.into())).await.is_err() {
+            return;
+        }
+    }
     loop {
         tokio::select! {
             update = receiver.recv() => match update {
@@ -32,7 +47,10 @@ async fn stream_progress(mut socket: WebSocket, state: Arc<AppState>) {
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                     if let Ok(status) = queue::progress_snapshot(&state) {
-                        if let Ok(payload) = serde_json::to_string(&status) {
+                        if let Ok(payload) = serde_json::to_string(&serde_json::json!({
+                            "type": "status",
+                            "job": status,
+                        })) {
                             if socket.send(Message::Text(payload.into())).await.is_err() {
                                 break;
                             }
