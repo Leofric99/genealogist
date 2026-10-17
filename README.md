@@ -36,11 +36,20 @@ Edit `docker-compose.yml` to set the host research directory, then:
 docker compose up --build
 ```
 
-The compose file mounts the host research folder at `/data/records`, persistent
-application data at `/app/data`, and generated stories at `/data/output`.
+The compose file mounts the host research folder at `/data/records` and
+generated stories at `/data/output`. Database/settings are stored in a Docker
+named volume mounted at `/app/data`, avoiding host bind-mount ownership errors.
+That volume persists across `docker compose down`; do not use `docker compose
+down -v` unless you intend to delete the database and encryption key.
 Browse to `http://localhost:3000`.
 The compose port is bound to localhost so the unauthenticated local UI is not
 published to other network interfaces.
+On Linux, set `PUID` and `PGID` to the owner IDs of the mounted research/output
+directories before building. Defaults are `1000:1000`:
+
+```sh
+PUID=$(id -u) PGID=$(id -g) docker compose up --build
+```
 
 ## Notes
 

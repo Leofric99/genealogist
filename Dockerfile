@@ -7,10 +7,13 @@ COPY templates ./templates
 RUN cargo build --release
 
 FROM debian:bookworm-slim
+ARG APP_UID=1000
+ARG APP_GID=1000
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
-    && useradd --system --create-home --uid 10001 app
+    && groupadd --gid "${APP_GID}" app \
+    && useradd --create-home --uid "${APP_UID}" --gid app app
 WORKDIR /app
 COPY --from=builder /build/target/release/genealogy-ocr-studio /usr/local/bin/genealogy-ocr-studio
 RUN mkdir -p /app/data /data/records /data/output/stories \

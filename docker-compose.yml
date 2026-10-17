@@ -1,6 +1,10 @@
 services:
   genealogy-ocr-studio:
-    build: .
+    build:
+      context: .
+      args:
+        APP_UID: ${PUID:-1000}
+        APP_GID: ${PGID:-1000}
     container_name: genealogy-ocr-studio
     ports:
       - "127.0.0.1:3000:3000"
@@ -12,8 +16,11 @@ services:
       # Optional; alternatively configure the key in the web Settings page.
       # GEMINI_API_KEY: ${GEMINI_API_KEY:-}
     volumes:
-      - ./data:/app/data
+      - app-data:/app/data
       # Replace ./research with the host folder containing your genealogy files.
       - ./research:/data/records
       - ./output:/data/output
     restart: unless-stopped
+
+volumes:
+  app-data:
