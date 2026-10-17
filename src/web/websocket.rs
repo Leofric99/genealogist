@@ -6,7 +6,7 @@ use axum::{
     },
     response::Response,
 };
-use futures_util::{SinkExt, StreamExt};
+use futures_util::StreamExt;
 use std::sync::Arc;
 
 pub async fn handler(State(state): State<Arc<AppState>>, upgrade: WebSocketUpgrade) -> Response {

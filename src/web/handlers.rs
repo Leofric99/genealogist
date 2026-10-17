@@ -327,7 +327,7 @@ pub async fn generate_story(
                 .to_owned(),
         ));
     }
-    let identifier = safe_component(xref);
+    let identifier = safe_component(&xref);
     let stories = state.config.output_dir.join("stories");
     let output = if request.destination.as_deref() == Some("person") {
         stories.join(&identifier).join("biography.md")

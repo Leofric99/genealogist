@@ -4,7 +4,7 @@ use chacha20poly1305::{
     ChaCha20Poly1305, Nonce,
 };
 use rand::{rngs::OsRng, RngCore};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 pub struct SecretCipher {
     cipher: ChaCha20Poly1305,
@@ -72,7 +72,7 @@ fn load_or_create_key(path: &Path) -> Result<[u8; 32]> {
     Ok(key)
 }
 
-fn create_key_file(path: &PathBuf, key: &[u8; 32]) -> Result<()> {
+fn create_key_file(path: &Path, key: &[u8; 32]) -> Result<()> {
     use std::io::Write;
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);

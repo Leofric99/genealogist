@@ -1,5 +1,6 @@
 use crate::{
     config::DEFAULT_SYSTEM_PROMPT,
+    db::JobStatus,
     scanner::{self, ScannedFile},
     state::{api_key, AppState},
     vision_filter,
