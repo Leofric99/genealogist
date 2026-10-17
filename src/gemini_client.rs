@@ -261,7 +261,7 @@ impl GeminiClient {
                         error = %error,
                         "transient Gemini transport failure; retrying request"
                     );
-                    tokio::time::sleep(retry_delay(attempt)).await;
+                    tokio::time::sleep(Self::retry_delay(attempt)).await;
                     continue;
                 }
                 Err(error) => {
@@ -283,14 +283,14 @@ impl GeminiClient {
                     }
                     .into());
                 }
-                if is_transient_api_status(status) && attempt + 1 < MAX_API_ATTEMPTS {
+                if Self::is_transient_api_status(status) && attempt + 1 < MAX_API_ATTEMPTS {
                     tracing::warn!(
                         model,
                         %status,
                         attempt = attempt + 1,
                         "transient Gemini API response; retrying request"
                     );
-                    tokio::time::sleep(retry_delay(attempt)).await;
+                    tokio::time::sleep(Self::retry_delay(attempt)).await;
                     continue;
                 }
                 anyhow::bail!("Gemini returned HTTP {status}: {message}");
@@ -535,7 +535,7 @@ fn render_transcript(metadata: &serde_yaml::Mapping, body: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_text_flash_model, is_transient_api_status, normalize_transcript};
+    use super::{is_text_flash_model, normalize_transcript, GeminiClient};
     use reqwest::StatusCode;
 
     #[test]
@@ -549,11 +549,21 @@ mod tests {
 
     #[test]
     fn transient_server_errors_are_retryable_but_client_errors_are_not() {
-        assert!(is_transient_api_status(StatusCode::SERVICE_UNAVAILABLE));
-        assert!(is_transient_api_status(StatusCode::BAD_GATEWAY));
-        assert!(is_transient_api_status(StatusCode::REQUEST_TIMEOUT));
-        assert!(!is_transient_api_status(StatusCode::BAD_REQUEST));
-        assert!(!is_transient_api_status(StatusCode::UNAUTHORIZED));
+        assert!(GeminiClient::is_transient_api_status(
+            StatusCode::SERVICE_UNAVAILABLE
+        ));
+        assert!(GeminiClient::is_transient_api_status(
+            StatusCode::BAD_GATEWAY
+        ));
+        assert!(GeminiClient::is_transient_api_status(
+            StatusCode::REQUEST_TIMEOUT
+        ));
+        assert!(!GeminiClient::is_transient_api_status(
+            StatusCode::BAD_REQUEST
+        ));
+        assert!(!GeminiClient::is_transient_api_status(
+            StatusCode::UNAUTHORIZED
+        ));
     }
 
     #[test]

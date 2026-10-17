@@ -1,5 +1,4 @@
 use crate::{
-    auth::AuthManager,
     config::DEFAULT_SYSTEM_PROMPT,
     db::{FileStatus, JobStatus},
     gedcom::{parser, rules},
