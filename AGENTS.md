@@ -8,8 +8,12 @@
   the current queue job. Keep blocking rusqlite and filesystem work off async
   request paths where it may become long-running.
 - Transcripts use YAML frontmatter followed by Markdown and are stored beside
-  the source image/PDF. Do not overwrite a transcript for a file whose content
-  hash has not changed.
+  the source image/PDF or in the user's configured sidecar subfolder. Resolve
+  all master and page-level transcript paths through `src/sidecar.rs`. Settings
+  are persisted in SQLite; scanner delta checks, direct/CLI processing, GEDCOM
+  audits, and Life Story discovery must remain compatible with either layout.
+  Do not overwrite a transcript for an unchanged file when it already exists
+  at the configured path.
 - Keep the default transcription prompt format-agnostic. Its table guidance
   should preserve source row/column relationships, require consistent cell
   counts, and use compact Markdown separators rather than content-width padding.
@@ -49,7 +53,6 @@
 
 ## Validation and safety
 
-- Run `cargo fmt --check` and `cargo test` after Rust changes.
 - Keep filesystem paths user-controlled only where the feature explicitly
   requires it; sanitize GEDCOM identifiers before using them in output paths.
 - Treat GEDCOM and OCR input as untrusted. Do not execute document content or
@@ -61,9 +64,18 @@
   source-output groups concurrently and shares one Gemini rate limiter across
   all requests.
 - On Gemini HTTP 429 responses, `GeminiClient` may list generation-capable Flash
-  models for the current API key and try alternatives; only update the
-  per-key active model after an alternate succeeds. Quotas remain project-based
-  and model-specific.
+  models for the current API key and try alternatives; exclude preview models
+  and only update the per-key active model after an alternate succeeds.
+  Transient transport failures and HTTP 408/5xx responses are retried with
+  backoff. A persistent file failure must be saved with status `error`, never
+  `transcribed`, so a later scan retries it.
+- The Life Story review instructions are in
+  `LIFE_STORY_REVIEW_PROMPT` in `src/web/handlers.rs`. Keep the document-type
+  guidance format-agnostic and preserve explicit surname inheritance rules for
+  grouped indexes and tables.
+- For long PDFs, a Gemini response with no candidate text is an empty-page
+  marker, not a page-processing error. Continue processing and consolidate
+  available page text; only fail the PDF when no page produced any text.
 - Directory scans use a cancellation token. Keep cancellation checks in
   filesystem traversal/hashing and make processing futures cancellable.
 - PDF operations use `lopdf`; always clean temporary page files with RAII.

@@ -95,7 +95,19 @@ PUID=$(id -u) PGID=$(id -g) docker compose up --build
 - Image files are heuristically filtered, then checked by Gemini Flash-Lite;
   PDFs bypass photo filtering. PDFs over ten pages are transcribed page by page
   before a consolidation pass.
-- Transcripts and page-level transcripts are written beside the source file.
+- Transcripts and page-level transcripts are written beside each source file
+  or in the configured sidecar subfolder.
+- Settings can keep sidecars beside each source or put them in a named
+  subfolder inside each source's directory. The setting is saved in SQLite;
+  scanning, direct processing, CLI delta checks, PDF page transcripts, GEDCOM
+  audits, and Life Story source discovery all use or recursively discover the
+  configured sidecars. Changing the location does not move old transcripts;
+  files are recognized as complete at the new location only when their
+  transcript is present there.
+- For long PDFs, pages for which Gemini returns no text are retained as
+  non-error placeholders and the other pages continue through consolidation.
+  The PDF is an error only when no page produced transcription text. Standalone
+  images with no Gemini text response are indexed as empty rather than failed.
 - The default transcription prompt preserves table columns, row alignment,
   empty cells, and source order without assuming a particular document type.
   Existing saved copies of the previous built-in prompt are upgraded on
@@ -107,7 +119,11 @@ PUID=$(id -u) PGID=$(id -g) docker compose up --build
   `GEMINI_VALIDATION_MODEL`.
 - On HTTP 429 quota responses, the app discovers Flash models available to the
   configured API key and tries alternatives that support `generateContent`.
-  Successful fallback choices are reused for later requests in this process.
+  Preview models are excluded from fallback choices, and transient network or
+  HTTP 408/5xx errors are retried with backoff. Persistent failures remain
+  indexed with `error` status and are attempted again on the next scan, not
+  treated as completed transcripts. Successful fallback choices are reused
+  for later requests in this process.
   Google quotas are per project, vary by model, and daily quotas reset at
   midnight Pacific; rotating models cannot bypass a project-wide quota.
 - An in-progress directory scan can be stopped from the dashboard. The stop
@@ -124,6 +140,10 @@ PUID=$(id -u) PGID=$(id -g) docker compose up --build
   geocoding. Review flagged items manually.
 - Life story source selection can tolerate OCR name variants when other evidence
   corroborates the match; the audit page shows the selected transcripts and
-  matching clues. Review those sources and the generated citations. See
+  matching clues. The biography reviewer is instructed to interpret varied
+  historical source formats, including surname-grouped indexes where a surname
+  is printed once and applies to following given/middle-name entries until the
+  next clear group or page/column boundary. Review those sources and the
+  generated citations. See
   [Life story source matching](./docs/lifestory-source-matching.md) for the
   scoring signals and limitations.

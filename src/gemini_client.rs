@@ -15,6 +15,10 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+const MAX_API_ATTEMPTS: usize = 3;
+pub const NO_PAGE_TEXT_MARKER: &str =
+    "[No transcription text was returned for this page; its content is undetermined.]";
+
 pub struct GeminiClient {
     http: reqwest::Client,
     limiter: Arc<DefaultDirectRateLimiter>,
@@ -33,6 +37,17 @@ struct ModelQuotaExceeded {
     model: String,
     message: String,
 }
+
+#[derive(Debug)]
+struct NoCandidateText;
+
+impl fmt::Display for NoCandidateText {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("Gemini response contained no candidate text")
+    }
+}
+
+impl Error for NoCandidateText {}
 
 impl fmt::Display for ModelQuotaExceeded {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -66,6 +81,7 @@ fn is_text_flash_model(model: &Value) -> Option<String> {
     let name = name.strip_prefix("models/").unwrap_or(name);
     let normalized = name.to_ascii_lowercase();
     if !normalized.contains("flash")
+        || normalized.contains("preview")
         || ["image", "audio", "live", "tts"]
             .iter()
             .any(|excluded| normalized.contains(excluded))
@@ -215,58 +231,91 @@ impl GeminiClient {
         parts: &[Value],
         max_tokens: Option<u32>,
     ) -> Result<String> {
-        self.limiter.until_ready().await;
         let mut generation_config = json!({ "temperature": 0.1 });
         if let Some(max_tokens) = max_tokens {
             generation_config["maxOutputTokens"] = json!(max_tokens);
         }
-        let response = self
-            .http
-            .post(format!(
-                "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
-            ))
-            .header("x-goog-api-key", key)
-            .json(&json!({
-                "contents": [{ "role": "user", "parts": parts }],
-                "generationConfig": generation_config
-            }))
-            .send()
-            .await
-            .with_context(|| format!("sending request to Gemini model {model}"))?;
-        let status = response.status();
-        let body: Value = response.json().await.context("reading Gemini response")?;
-        if !status.is_success() {
-            let message = body
-                .pointer("/error/message")
-                .and_then(Value::as_str)
-                .unwrap_or("Gemini request failed");
-            if status == StatusCode::TOO_MANY_REQUESTS {
-                return Err(ModelQuotaExceeded {
-                    model: model.to_owned(),
-                    message: message.to_owned(),
+        for attempt in 0..MAX_API_ATTEMPTS {
+            self.limiter.until_ready().await;
+            let response = self
+                .http
+                .post(format!(
+                    "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+                ))
+                .header("x-goog-api-key", key)
+                .json(&json!({
+                    "contents": [{ "role": "user", "parts": parts }],
+                    "generationConfig": generation_config
+                }))
+                .send()
+                .await;
+            let response = match response {
+                Ok(response) => response,
+                Err(error)
+                    if attempt + 1 < MAX_API_ATTEMPTS
+                        && (error.is_timeout() || error.is_connect()) =>
+                {
+                    tracing::warn!(
+                        model,
+                        attempt = attempt + 1,
+                        error = %error,
+                        "transient Gemini transport failure; retrying request"
+                    );
+                    tokio::time::sleep(retry_delay(attempt)).await;
+                    continue;
                 }
-                .into());
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("sending request to Gemini model {model}"));
+                }
+            };
+            let status = response.status();
+            let body: Value = response.json().await.context("reading Gemini response")?;
+            if !status.is_success() {
+                let message = body
+                    .pointer("/error/message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Gemini request failed");
+                if status == StatusCode::TOO_MANY_REQUESTS {
+                    return Err(ModelQuotaExceeded {
+                        model: model.to_owned(),
+                        message: message.to_owned(),
+                    }
+                    .into());
+                }
+                if is_transient_api_status(status) && attempt + 1 < MAX_API_ATTEMPTS {
+                    tracing::warn!(
+                        model,
+                        %status,
+                        attempt = attempt + 1,
+                        "transient Gemini API response; retrying request"
+                    );
+                    tokio::time::sleep(retry_delay(attempt)).await;
+                    continue;
+                }
+                anyhow::bail!("Gemini returned HTTP {status}: {message}");
             }
-            anyhow::bail!("Gemini returned HTTP {status}: {message}");
+            if body
+                .pointer("/candidates/0/finishReason")
+                .and_then(Value::as_str)
+                == Some("MAX_TOKENS")
+            {
+                anyhow::bail!("Gemini reached its output token limit; refusing to save a potentially truncated response");
+            }
+            let texts: Vec<&str> = body
+                .pointer("/candidates/0/content/parts")
+                .and_then(Value::as_array)
+                .ok_or(NoCandidateText)?
+                .iter()
+                .filter_map(|part| part.get("text").and_then(Value::as_str))
+                .collect();
+            let text = texts.join("\n");
+            if text.trim().is_empty() {
+                return Err(NoCandidateText.into());
+            }
+            return Ok(text);
         }
-        if body
-            .pointer("/candidates/0/finishReason")
-            .and_then(Value::as_str)
-            == Some("MAX_TOKENS")
-        {
-            anyhow::bail!("Gemini reached its output token limit; refusing to save a potentially truncated response");
-        }
-        let texts: Vec<&str> = body
-            .pointer("/candidates/0/content/parts")
-            .and_then(Value::as_array)
-            .context("Gemini response contained no candidate text")?
-            .iter()
-            .filter_map(|part| part.get("text").and_then(Value::as_str))
-            .collect();
-        if texts.is_empty() {
-            anyhow::bail!("Gemini response contained no text");
-        }
-        Ok(texts.join("\n"))
+        unreachable!("Gemini retry loop returns or continues")
     }
 
     pub async fn validate_image(&self, path: &Path, key: &str) -> Result<bool> {
@@ -297,6 +346,18 @@ impl GeminiClient {
                 answer.trim()
             )
         }
+    }
+
+    fn is_transient_api_status(status: StatusCode) -> bool {
+        status == StatusCode::REQUEST_TIMEOUT
+            || status == StatusCode::INTERNAL_SERVER_ERROR
+            || status == StatusCode::BAD_GATEWAY
+            || status == StatusCode::SERVICE_UNAVAILABLE
+            || status == StatusCode::GATEWAY_TIMEOUT
+    }
+
+    fn retry_delay(attempt: usize) -> std::time::Duration {
+        std::time::Duration::from_secs(1_u64 << attempt)
     }
 
     pub async fn transcribe_file(
@@ -346,7 +407,7 @@ impl GeminiClient {
             .collect::<Vec<_>>()
             .join("\n\n");
         let instructions = format!(
-            "{system_prompt}\n\nThe following are complete page-by-page transcriptions of one multi-page record. Consolidate them into one cohesive master transcript, preserving every fact, page sequence, table, note, and all uncertainty. Do not omit repeated or contradictory content; identify it explicitly."
+            "{system_prompt}\n\nThe following are page-by-page transcriptions of one multi-page record. Consolidate them into one cohesive master transcript, preserving every transcribed fact, page sequence, table, note, and uncertainty. Do not omit repeated or contradictory content; identify it explicitly. The exact marker {NO_PAGE_TEXT_MARKER} means Gemini returned no transcription text for that page. It is internal processing metadata, not text printed on the record: do not copy it into the master transcript or infer what that page contains. Preserve the surrounding pages in their original order."
         );
         let raw = self
             .generate(
@@ -380,6 +441,10 @@ impl GeminiClient {
             .await?
             .text)
     }
+}
+
+pub fn is_no_candidate_text(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<NoCandidateText>().is_some()
 }
 
 pub fn mime_for_path(path: &Path) -> &'static str {
@@ -445,19 +510,19 @@ fn ensure_metadata_fields(metadata: &mut serde_yaml::Mapping) {
     {
         for individual in individuals {
             if let serde_yaml::Value::String(name) = individual {
-            let mut person = serde_yaml::Mapping::new();
-            person.insert(
-                serde_yaml::Value::String("name".to_owned()),
-                serde_yaml::Value::String(name.clone()),
-            );
-            *individual = serde_yaml::Value::Mapping(person);
+                let mut person = serde_yaml::Mapping::new();
+                person.insert(
+                    serde_yaml::Value::String("name".to_owned()),
+                    serde_yaml::Value::String(name.clone()),
+                );
+                *individual = serde_yaml::Value::Mapping(person);
             }
             if let serde_yaml::Value::Mapping(person) = individual {
-            for key in ["name", "role", "age", "occupation", "birthplace"] {
-                person
-                    .entry(serde_yaml::Value::String(key.to_owned()))
-                    .or_insert(serde_yaml::Value::Null);
-            }
+                for key in ["name", "role", "age", "occupation", "birthplace"] {
+                    person
+                        .entry(serde_yaml::Value::String(key.to_owned()))
+                        .or_insert(serde_yaml::Value::Null);
+                }
             }
         }
     }
@@ -470,7 +535,26 @@ fn render_transcript(metadata: &serde_yaml::Mapping, body: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_text_flash_model, normalize_transcript};
+    use super::{is_text_flash_model, is_transient_api_status, normalize_transcript};
+    use reqwest::StatusCode;
+
+    #[test]
+    fn empty_candidate_responses_have_a_distinct_error_type() {
+        let empty_response = anyhow::Error::new(super::NoCandidateText);
+        let other_error = anyhow::anyhow!("Gemini request failed");
+
+        assert!(super::is_no_candidate_text(&empty_response));
+        assert!(!super::is_no_candidate_text(&other_error));
+    }
+
+    #[test]
+    fn transient_server_errors_are_retryable_but_client_errors_are_not() {
+        assert!(is_transient_api_status(StatusCode::SERVICE_UNAVAILABLE));
+        assert!(is_transient_api_status(StatusCode::BAD_GATEWAY));
+        assert!(is_transient_api_status(StatusCode::REQUEST_TIMEOUT));
+        assert!(!is_transient_api_status(StatusCode::BAD_REQUEST));
+        assert!(!is_transient_api_status(StatusCode::UNAUTHORIZED));
+    }
 
     #[test]
     fn only_generation_capable_text_flash_models_are_fallbacks() {
@@ -480,6 +564,10 @@ mod tests {
         });
         let flash_image = serde_json::json!({
             "name": "models/gemini-2.5-flash-image",
+            "supportedGenerationMethods": ["generateContent"]
+        });
+        let preview = serde_json::json!({
+            "name": "models/gemini-3-flash-preview",
             "supportedGenerationMethods": ["generateContent"]
         });
         let embeddings = serde_json::json!({
@@ -492,6 +580,7 @@ mod tests {
             Some("gemini-2.5-flash")
         );
         assert_eq!(is_text_flash_model(&flash_image), None);
+        assert_eq!(is_text_flash_model(&preview), None);
         assert_eq!(is_text_flash_model(&embeddings), None);
     }
 

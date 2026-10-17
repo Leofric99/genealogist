@@ -4,6 +4,7 @@ use crate::{
     db::{FileStatus, JobStatus},
     gedcom::{parser, rules},
     queue,
+    sidecar::SidecarConfig,
     state::{api_key, AppState},
     web::{
         story_format,
@@ -27,6 +28,16 @@ use std::{
 };
 use tracing::warn;
 
+const LIFE_STORY_REVIEW_PROMPT: &str = r#"You are a careful genealogical researcher reviewing OCR transcriptions of historical records. Read every supplied transcript in full before deciding what it says. Treat the transcription as evidence, not as unquestionable truth; preserve uncertainty, distinguish the subject from people with similar names, and never add facts from outside the supplied GEDCOM and source material.
+
+First identify each source's structure and conventions, then extract only the entries relevant to the requested person. Historical sources vary widely: civil birth, marriage and death registers and indexes; parish baptism, marriage and burial registers; census schedules; probate calendars, wills and inventories; military service, pension and casualty lists; electoral rolls and directories; passenger, immigration and naturalization lists; newspapers and obituaries; school, employment, land and court records; cemetery and memorial inscriptions; family letters, diaries, photographs and captions; and other forms, lists or tables. Do not force a source into a format it does not use.
+
+Read tables, columns, headings, page breaks, ditto marks, braces, indentation and repeated labels as structural evidence. In surname-grouped indexes, the surname may be printed only once at the start of a group, column or page while later entries show only given and middle names. Apply that surname to following entries only while the layout or wording clearly continues the group; stop at a new surname, heading, column or page boundary, or other clear change. Join the inherited surname to each relevant given/middle name when identifying that entry, but make clear when this is a structural reconstruction rather than a fully printed name. Do not mistake a group heading for a person, carry a surname across an unclear boundary, or combine separate entries. Preserve distinct people, rows, dates, registration districts, page/volume references and relationships. For census and household records, distinguish the head, spouse, children, visitors, lodgers and neighboring households. For indexes, distinguish the indexed event subject from informants, relatives, witnesses and other names appearing nearby.
+
+Compare names alongside dates, ages, places, relationships, occupations and record context. OCR spelling similarity alone does not prove identity. Use the provided heuristic match clues only as leads; confirm them against the transcription and GEDCOM, and state when identity or surname expansion remains uncertain. Resolve no conflict by silently choosing one version: cite the competing evidence and explain the uncertainty.
+
+Write a clear chronological biography using only supported facts. Use Markdown section headings (## or deeper). Immediately after every section heading, with no blank line between, put a line formatted exactly **Confidence: NN%**. This is a qualitative estimate of how strongly the cited evidence supports that section, not statistical certainty. Cite every historical or biographical claim with an inline Markdown link to one or more allowed transcript files, using exactly the relative paths supplied. Put each factual sentence or list item on its own line and cite it on that same line; do not leave factual introductory or concluding text uncited. Include a Sources section whose entries link to cited transcripts. Return only the biography."#;
+
 #[derive(Serialize)]
 pub struct StatusResponse {
     pub job: JobStatus,
@@ -37,12 +48,16 @@ pub struct StatusResponse {
 pub struct SettingsResponse {
     pub has_api_key: bool,
     pub system_prompt: String,
+    pub sidecar_mode: String,
+    pub sidecar_folder: String,
 }
 
 #[derive(Deserialize)]
 pub struct SaveSettingsRequest {
     pub api_key: Option<String>,
     pub system_prompt: Option<String>,
+    pub sidecar_mode: Option<String>,
+    pub sidecar_folder: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -237,12 +252,15 @@ pub async fn get_settings(
             .as_ref()
             .is_some_and(|key| !key.trim().is_empty())
     };
+    let sidecars = SidecarConfig::load(&state.db)?;
     Ok(Json(SettingsResponse {
         has_api_key,
         system_prompt: state
             .db
             .setting("system_prompt")?
             .unwrap_or_else(|| DEFAULT_SYSTEM_PROMPT.to_owned()),
+        sidecar_mode: sidecars.mode().to_owned(),
+        sidecar_folder: sidecars.folder().to_owned(),
     }))
 }
 
@@ -250,24 +268,59 @@ pub async fn save_settings(
     State(state): State<Arc<AppState>>,
     Json(request): Json<SaveSettingsRequest>,
 ) -> Result<Json<Value>, ApiError> {
+    if request
+        .api_key
+        .as_deref()
+        .is_some_and(|key| !key.trim().is_empty() && key.len() > 4096)
+    {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            "API key is too long".to_owned(),
+        ));
+    }
+    if request
+        .system_prompt
+        .as_deref()
+        .is_some_and(|prompt| prompt.len() > 100_000)
+    {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            "System prompt exceeds 100,000 characters".to_owned(),
+        ));
+    }
+    let sidecars = if request.sidecar_mode.is_some() || request.sidecar_folder.is_some() {
+        let current = SidecarConfig::load(&state.db)?;
+        let mode = request
+            .sidecar_mode
+            .as_deref()
+            .unwrap_or_else(|| current.mode());
+        let folder = request
+            .sidecar_folder
+            .as_deref()
+            .unwrap_or_else(|| current.folder());
+        let folder = if mode == crate::sidecar::MODE_SUBFOLDER || !folder.trim().is_empty() {
+            folder
+        } else {
+            current.folder()
+        };
+        Some(
+            SidecarConfig::new(mode, folder)
+                .map_err(|error| ApiError(StatusCode::BAD_REQUEST, error.to_string()))?,
+        )
+    } else {
+        None
+    };
     if let Some(key) = request.api_key.filter(|key| !key.trim().is_empty()) {
-        if key.len() > 4096 {
-            return Err(ApiError(
-                StatusCode::BAD_REQUEST,
-                "API key is too long".to_owned(),
-            ));
-        }
         let encrypted = state.cipher.encrypt(key.trim())?;
         state.db.set_setting("gemini_api_key", &encrypted)?;
     }
     if let Some(prompt) = request.system_prompt {
-        if prompt.len() > 100_000 {
-            return Err(ApiError(
-                StatusCode::BAD_REQUEST,
-                "System prompt exceeds 100,000 characters".to_owned(),
-            ));
-        }
         state.db.set_setting("system_prompt", prompt.trim())?;
+    }
+    if let Some(sidecars) = sidecars {
+        state
+            .db
+            .set_sidecar_settings(sidecars.mode(), sidecars.folder())?;
     }
     Ok(Json(json!({ "saved": true })))
 }
@@ -481,7 +534,7 @@ pub async fn generate_story(
         .collect::<Vec<_>>()
         .join("\n");
     let prompt = format!(
-        "Write a clear chronological biography using only the supplied GEDCOM facts and transcriptions. Use Markdown section headings (## or deeper). Immediately after every section heading, with no blank line between, put a line formatted exactly **Confidence: NN%**. This percentage is a qualitative estimate of how strongly the cited evidence supports the claims in that section, not statistical certainty. Cite every historical or biographical claim with an inline Markdown link to one or more source transcripts, using exactly the relative paths listed below. Put each factual sentence or list item on its own line and cite it on that same line; do not leave factual introductory or concluding text uncited. Do not make unsupported claims. Explain conflicting evidence and uncertainty. Heuristic source-match evidence is not proof of identity: compare names, dates, ages, places, and other facts before attributing a source to the subject. If identity remains uncertain, say so and lower the section confidence. Include a Sources section whose entries link to the cited transcripts. Return only the biography.\n\nPERSON FACTS:\n{facts}\n\nALLOWED TRANSCRIPT SOURCE PATHS:\n{allowed_sources}\n\nTRANSCRIPTIONS:\n{source_text}"
+        "{LIFE_STORY_REVIEW_PROMPT}\n\nPERSON FACTS:\n{facts}\n\nALLOWED TRANSCRIPT SOURCE PATHS:\n{allowed_sources}\n\nTRANSCRIPTIONS:\n{source_text}"
     );
     let key = api_key(&state)?;
     let story = state.gemini.text_prompt(&key, &prompt).await?;

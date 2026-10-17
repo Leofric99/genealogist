@@ -96,6 +96,20 @@ impl Database {
         Ok(())
     }
 
+    pub fn set_sidecar_settings(&self, mode: &str, folder: &str) -> Result<()> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        for (key, value) in [("sidecar_mode", mode), ("sidecar_folder", folder)] {
+            transaction.execute(
+                "INSERT INTO settings (key, value) VALUES (?1, ?2)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params![key, value],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
     pub fn file_hash(&self, path: &str) -> Result<Option<String>> {
         Ok(self
             .connection()?
@@ -112,6 +126,18 @@ impl Database {
                 row.get(0)
             })
             .optional()?)
+    }
+
+    pub fn file_transcript_path(&self, path: &str) -> Result<Option<String>> {
+        Ok(self
+            .connection()?
+            .query_row(
+                "SELECT transcript_path FROM files WHERE path = ?1",
+                [path],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten())
     }
 
     pub fn save_file(

@@ -30,6 +30,27 @@ instructed to treat those reasons as heuristic rather than proof, compare the
 record's other details, and express uncertainty when evidence conflicts. The
 audit page lists selected transcripts and the reasons they matched.
 
+## Historical record review
+
+The Life Story reviewer reads the supplied transcripts as evidence and first
+identifies each source's structure. Its guidance covers civil and parish
+registers and indexes, census schedules, probate records, military lists,
+directories and electoral rolls, passenger and immigration records,
+newspapers, school and employment records, land and court records, cemetery
+inscriptions, and family letters, diaries and photographs. It avoids assuming
+that every source is a table or that every name is printed in the same form.
+
+In particular, some indexes print a surname only once at the start of a group,
+column or page, then give only the first and middle names for subsequent
+entries. The reviewer is instructed to carry that surname forward only while
+the layout clearly continues the group, to stop at a new surname or clear
+boundary, and to identify any reconstructed full name as a structural reading
+rather than text fully printed on that line. This helps relate index entries
+without silently merging neighboring people or carrying a surname across
+columns/pages. The instructions are in `LIFE_STORY_REVIEW_PROMPT` in
+`src/web/handlers.rs`; the separate Settings prompt controls transcription, not
+this biography-review prompt.
+
 ## Confidence and citations
 
 Each Life Story section heading must be followed immediately by a line of the

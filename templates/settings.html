@@ -21,12 +21,28 @@
     </label>
     <button type="button" @click="save()">Save prompt and settings</button>
   </div>
+  <div class="card">
+    <h2>Transcript sidecar storage</h2>
+    <p class="muted">Choose where Markdown transcripts and per-page PDF transcripts are stored. A named subfolder is created inside each source document's directory.</p>
+    <label>Storage location
+      <select x-model="sidecarMode">
+        <option value="same_directory">Beside each source document</option>
+        <option value="subfolder">In a subfolder beside each source document</option>
+      </select>
+    </label>
+    <label x-show="sidecarMode === 'subfolder'">Subfolder name
+      <input type="text" maxlength="80" autocomplete="off" x-model="sidecarFolder" :required="sidecarMode === 'subfolder'" placeholder="transcripts">
+    </label>
+    <button type="button" class="secondary" @click="save()">Save sidecar settings</button>
+  </div>
 </section>
 <script>
 function settingsPage() {
   return {
     apiKey: "",
     systemPrompt: "",
+    sidecarMode: "same_directory",
+    sidecarFolder: "transcripts",
     keyState: "",
     message: "",
     async load() {
@@ -36,6 +52,8 @@ function settingsPage() {
         if (!response.ok) throw new Error(data.error || "Could not load settings");
         this.keyState = data.has_api_key ? "An API key is configured. It is never returned to the browser." : "No API key is configured.";
         this.systemPrompt = data.system_prompt;
+        this.sidecarMode = data.sidecar_mode;
+        this.sidecarFolder = data.sidecar_folder;
       } catch (error) { this.message = error.message; }
     },
     async save() {
@@ -43,7 +61,12 @@ function settingsPage() {
       try {
         const response = await fetch("/api/settings", {
           method: "POST", headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ api_key: this.apiKey, system_prompt: this.systemPrompt })
+          body: JSON.stringify({
+            api_key: this.apiKey,
+            system_prompt: this.systemPrompt,
+            sidecar_mode: this.sidecarMode,
+            sidecar_folder: this.sidecarFolder
+          })
         });
         const data = await response.json();
         if (!response.ok) throw new Error(data.error || "Save failed");

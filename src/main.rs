@@ -7,6 +7,7 @@ mod pdf;
 mod queue;
 mod scanner;
 mod secret;
+mod sidecar;
 mod state;
 mod vision_filter;
 mod web;
@@ -23,6 +24,7 @@ use config::Config;
 use db::Database;
 use gemini_client::GeminiClient;
 use secret::SecretCipher;
+use sidecar::SidecarConfig;
 use state::AppState;
 use std::{path::PathBuf, sync::Arc};
 use tokio::sync::{broadcast, mpsc};
@@ -156,22 +158,39 @@ async fn serve() -> Result<()> {
 
 fn cli_scan(directory: &std::path::Path, database: &std::path::Path) -> Result<()> {
     let db = Database::open(database)?;
+    let sidecars = SidecarConfig::load(&db)?;
     let files = scanner::scan_and_hash(directory)?;
     let mut new_or_modified = 0usize;
     let mut unchanged = 0usize;
     let mut existing_transcripts = 0usize;
     for file in &files {
         let path = file.path.to_string_lossy().into_owned();
-        if db.file_hash(&path)?.as_deref() == Some(&file.sha256) {
+        let indexed_hash = db.file_hash(&path)?;
+        let status = db.file_status(&path)?;
+        let transcript = sidecars.transcript_path(&file.path);
+        let transcript_string = transcript.to_string_lossy();
+        let stored_transcript = db.file_transcript_path(&path)?;
+        let unchanged_and_complete = indexed_hash.as_deref() == Some(&file.sha256)
+            && match status.as_deref() {
+                Some("filtered") => !transcript.is_file(),
+                Some("empty") => !transcript.is_file(),
+                Some("transcribed") | Some("external_transcript") => {
+                    stored_transcript.as_deref() == Some(transcript_string.as_ref())
+                        && transcript.is_file()
+                }
+                _ => false,
+            };
+        if unchanged_and_complete {
             unchanged += 1;
         } else {
-            let transcript = file.path.with_extension("md");
-            if db.file_hash(&path)?.is_none() && transcript.is_file() {
+            if indexed_hash.as_deref() == Some(&file.sha256) && status.as_deref() == Some("error") {
+                new_or_modified += 1;
+            } else if indexed_hash.is_none() && transcript.is_file() {
                 db.save_file(
                     &path,
                     &file.sha256,
                     "external_transcript",
-                    Some(&transcript.to_string_lossy()),
+                    Some(transcript_string.as_ref()),
                     None,
                 )?;
                 existing_transcripts += 1;

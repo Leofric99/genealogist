@@ -2,16 +2,13 @@ use crate::{
     config::DEFAULT_SYSTEM_PROMPT,
     db::JobStatus,
     scanner::{self, ScannedFile},
+    sidecar::SidecarConfig,
     state::{api_key, AppState},
     vision_filter,
 };
 use anyhow::{Context, Result};
 use futures_util::{stream, StreamExt};
-use std::{
-    collections::BTreeMap,
-    path::{Path, PathBuf},
-    sync::Arc,
-};
+use std::{collections::BTreeMap, path::Path, sync::Arc};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
@@ -43,6 +40,7 @@ pub async fn run_scan(state: Arc<AppState>) -> Result<()> {
     state.db.reset_job_progress()?;
     publish_status(&state).await;
     let root = state.config.records_dir.clone();
+    let sidecars = SidecarConfig::load(&state.db)?;
     let scan_cancellation = cancellation.clone();
     let files = tokio::task::spawn_blocking(move || {
         scanner::scan_and_hash_cancellable(&root, &scan_cancellation)
@@ -56,7 +54,7 @@ pub async fn run_scan(state: Arc<AppState>) -> Result<()> {
 
     let mut output_groups = BTreeMap::<String, Vec<ScannedFile>>::new();
     for file in files {
-        let output = transcript_path(&file.path);
+        let output = sidecars.transcript_path(&file.path);
         output_groups
             .entry(output.to_string_lossy().to_lowercase())
             .or_default()
@@ -67,12 +65,13 @@ pub async fn run_scan(state: Arc<AppState>) -> Result<()> {
         let state = Arc::clone(&state);
         let active_label = active_label.clone();
         let cancellation = cancellation.clone();
+        let sidecars = sidecars.clone();
         async move {
             for file in group {
                 let source = file.path.to_string_lossy().into_owned();
                 state.db.update_job(None, 0, 0, Some(&active_label), None)?;
                 publish_status(&state).await;
-                let result = process_one(&state, &file, None, Some(&cancellation)).await;
+                let result = process_one(&state, &file, &sidecars, None, Some(&cancellation)).await;
                 let (skipped, message) = match result {
                     Ok(ProcessResult::Processed) => (0, None),
                     Ok(ProcessResult::Skipped(reason)) => (1, Some(reason)),
@@ -129,6 +128,7 @@ enum ProcessResult {
 async fn process_one(
     state: &AppState,
     file: &ScannedFile,
+    sidecars: &SidecarConfig,
     image_score: Option<vision_filter::VisionScore>,
     cancellation: Option<&CancellationToken>,
 ) -> Result<ProcessResult> {
@@ -136,26 +136,33 @@ async fn process_one(
     let source = path.to_string_lossy().into_owned();
     let previous_hash = state.db.file_hash(&source)?;
     let previous_status = state.db.file_status(&source)?;
-    if previous_hash.as_deref() == Some(&file.sha256)
-        && matches!(
-            previous_status.as_deref(),
-            Some("transcribed" | "filtered" | "external_transcript")
-        )
-    {
+    let transcript_path = sidecars.transcript_path(path);
+    let transcript_path_string = transcript_path.to_string_lossy();
+    let previous_transcript_path = state.db.file_transcript_path(&source)?;
+    let unchanged_and_complete = previous_hash.as_deref() == Some(&file.sha256)
+        && match previous_status.as_deref() {
+            Some("filtered") | Some("empty") => !transcript_path.is_file(),
+            Some("transcribed") | Some("external_transcript") => {
+                previous_transcript_path.as_deref() == Some(transcript_path_string.as_ref())
+                    && transcript_path.is_file()
+            }
+            _ => false,
+        };
+    if unchanged_and_complete {
         return Ok(ProcessResult::Skipped(
             "Unchanged file already handled".to_owned(),
         ));
     }
 
-    let transcript_path = transcript_path(path);
     let is_pdf = file.extension == "pdf";
     if transcript_path.is_file()
         && previous_hash
             .as_deref()
             .map_or(true, |hash| hash == file.sha256)
-        && previous_status.as_deref() != Some("transcribed")
+        && previous_status.as_deref() != Some("error")
+        && previous_transcript_path.as_deref() != Some(transcript_path_string.as_ref())
     {
-        let transcript = transcript_path.to_string_lossy().into_owned();
+        let transcript = transcript_path_string.into_owned();
         state.db.save_file(
             &source,
             &file.sha256,
@@ -200,9 +207,17 @@ async fn process_one(
         .setting("system_prompt")?
         .unwrap_or_else(|| DEFAULT_SYSTEM_PROMPT.to_owned());
     let transcript = if is_pdf {
-        transcribe_pdf(state, path, &key, &system_prompt, cancellation).await?
+        transcribe_pdf(state, path, &key, &system_prompt, sidecars, cancellation).await?
     } else {
-        let is_document = state.gemini.validate_image(path, &key).await?;
+        let is_document = match state.gemini.validate_image(path, &key).await {
+            Ok(is_document) => is_document,
+            Err(error) if crate::gemini_client::is_no_candidate_text(&error) => {
+                return save_empty_image(state, &source, &file.sha256).map(|()| {
+                    ProcessResult::Skipped("Gemini returned no text for this image".to_owned())
+                });
+            }
+            Err(error) => return Err(error),
+        };
         if !is_document {
             state
                 .db
@@ -211,15 +226,22 @@ async fn process_one(
                 "Gemini classified image as a photo".to_owned(),
             ));
         }
-        state
+        match state
             .gemini
             .transcribe_file(path, &key, &system_prompt)
-            .await?
+            .await
+        {
+            Ok(transcript) => transcript,
+            Err(error) if crate::gemini_client::is_no_candidate_text(&error) => {
+                return save_empty_image(state, &source, &file.sha256).map(|()| {
+                    ProcessResult::Skipped("Gemini returned no text for this image".to_owned())
+                });
+            }
+            Err(error) => return Err(error),
+        }
     };
 
-    tokio::fs::write(&transcript_path, transcript)
-        .await
-        .with_context(|| format!("writing transcript {}", transcript_path.display()))?;
+    write_sidecar(&transcript_path, &transcript).await?;
     let target = transcript_path.to_string_lossy().into_owned();
     state
         .db
@@ -227,11 +249,16 @@ async fn process_one(
     Ok(ProcessResult::Processed)
 }
 
+fn save_empty_image(state: &AppState, source: &str, sha256: &str) -> Result<()> {
+    state.db.save_file(source, sha256, "empty", None, None)
+}
+
 async fn transcribe_pdf(
     state: &AppState,
     path: &Path,
     key: &str,
     prompt: &str,
+    sidecars: &SidecarConfig,
     cancellation: Option<&CancellationToken>,
 ) -> Result<String> {
     let count_path = path.to_path_buf();
@@ -255,30 +282,59 @@ async fn transcribe_pdf(
     .await??
     .context("PDF page splitting was cancelled")?;
     let mut transcripts = Vec::with_capacity(page_paths.len());
+    let mut has_page_output = false;
     for (index, page_path) in page_paths.iter().enumerate() {
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
             anyhow::bail!("scan cancelled");
         }
-        let transcript = state.gemini.transcribe_file(page_path, key, prompt).await?;
-        let page_target = page_transcript_path(path, index + 1);
-        tokio::fs::write(&page_target, &transcript)
-            .await
-            .with_context(|| format!("writing page transcript {}", page_target.display()))?;
+        let transcript = match state.gemini.transcribe_file(page_path, key, prompt).await {
+            Ok(transcript) if !transcript.trim().is_empty() => {
+                has_page_output = true;
+                transcript
+            }
+            Ok(_) => {
+                info!(
+                    pdf = %path.display(),
+                    page = index + 1,
+                    "Gemini returned no transcription text for PDF page"
+                );
+                no_page_text_marker()
+            }
+            Err(error) if crate::gemini_client::is_no_candidate_text(&error) => {
+                info!(
+                    pdf = %path.display(),
+                    page = index + 1,
+                    "Gemini returned no transcription text for PDF page"
+                );
+                no_page_text_marker()
+            }
+            Err(error) => return Err(error),
+        };
+        let page_target = sidecars.page_transcript_path(path, index + 1);
+        write_sidecar(&page_target, &transcript).await?;
         transcripts.push(transcript);
+    }
+    if !has_page_output {
+        anyhow::bail!("Gemini returned no transcription text for any page of this PDF");
     }
     state.gemini.consolidate(&transcripts, key, prompt).await
 }
 
-fn transcript_path(source: &Path) -> PathBuf {
-    source.with_extension("md")
+fn no_page_text_marker() -> String {
+    crate::gemini_client::NO_PAGE_TEXT_MARKER.to_owned()
 }
 
-fn page_transcript_path(source: &Path, page: usize) -> PathBuf {
-    let stem = source
-        .file_stem()
-        .and_then(|stem| stem.to_str())
-        .unwrap_or("document");
-    source.with_file_name(format!("{stem}.page-{page:04}.md"))
+async fn write_sidecar(path: &Path, contents: &str) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .with_context(|| format!("creating transcript directory {}", parent.display()))?;
+        }
+    }
+    tokio::fs::write(path, contents)
+        .await
+        .with_context(|| format!("writing transcript {}", path.display()))
 }
 
 pub async fn publish_status(state: &AppState) {
@@ -337,6 +393,7 @@ pub async fn direct_process(state: &AppState, path: &Path) -> Result<String> {
     }
     let hash_path = path.to_path_buf();
     let one = tokio::task::spawn_blocking(move || scanner::hash_file(&hash_path)).await??;
+    let sidecars = SidecarConfig::load(&state.db)?;
     let image_score = if one.extension == "pdf" {
         None
     } else {
@@ -353,8 +410,10 @@ pub async fn direct_process(state: &AppState, path: &Path) -> Result<String> {
             score.horizontal_line_rows
         )
     }).unwrap_or_default();
-    let result = match process_one(state, &one, image_score, None).await? {
-        ProcessResult::Processed => format!("Transcript: {}", transcript_path(path).display()),
+    let result = match process_one(state, &one, &sidecars, image_score, None).await? {
+        ProcessResult::Processed => {
+            format!("Transcript: {}", sidecars.transcript_path(path).display())
+        }
         ProcessResult::Skipped(reason) => format!("Skipped: {reason}"),
     };
     Ok(format!("{score_summary}{result}"))
