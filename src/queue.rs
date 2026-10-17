@@ -11,6 +11,7 @@ use std::{
     sync::Arc,
 };
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 pub fn spawn_worker(state: Arc<AppState>, mut receiver: mpsc::Receiver<()>) {
@@ -30,18 +31,40 @@ pub fn spawn_worker(state: Arc<AppState>, mut receiver: mpsc::Receiver<()>) {
 }
 
 pub async fn run_scan(state: Arc<AppState>) -> Result<()> {
+    let cancellation = state
+        .scan_cancellation
+        .lock()
+        .map_err(|_| anyhow::anyhow!("scan cancellation lock poisoned"))?
+        .clone();
     state.db.reset_job_progress()?;
     publish_status(&state).await;
     let root = state.config.records_dir.clone();
-    let files = tokio::task::spawn_blocking(move || scanner::scan_and_hash(&root)).await??;
+    let scan_cancellation = cancellation.clone();
+    let files = tokio::task::spawn_blocking(move || {
+        scanner::scan_and_hash_cancellable(&root, &scan_cancellation)
+    })
+    .await??;
+    let Some(files) = files else {
+        return finish_stopped_scan(&state).await;
+    };
     state.db.update_job(Some(files.len()), 0, 0, None, None)?;
     publish_status(&state).await;
 
     for file in files {
+        if cancellation.is_cancelled() {
+            return finish_stopped_scan(&state).await;
+        }
         let source = file.path.to_string_lossy().into_owned();
         state.db.update_job(None, 0, 0, Some(&source), None)?;
         publish_status(&state).await;
-        match process_one(&state, &file, None).await {
+        let result = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => {
+                return finish_stopped_scan(&state).await;
+            }
+            result = process_one(&state, &file, None, Some(&cancellation)) => result,
+        };
+        match result {
             Ok(ProcessResult::Processed) => {
                 state.db.update_job(None, 1, 0, None, None)?;
             }
@@ -60,8 +83,17 @@ pub async fn run_scan(state: Arc<AppState>) -> Result<()> {
         publish_status(&state).await;
     }
 
+    if cancellation.is_cancelled() {
+        return finish_stopped_scan(&state).await;
+    }
     state.db.finish_job(Some("Scan complete"))?;
     publish_status(&state).await;
+    Ok(())
+}
+
+async fn finish_stopped_scan(state: &AppState) -> Result<()> {
+    state.db.finish_job(Some("Scan stopped by user"))?;
+    publish_status(state).await;
     Ok(())
 }
 
@@ -74,6 +106,7 @@ async fn process_one(
     state: &AppState,
     file: &ScannedFile,
     image_score: Option<vision_filter::VisionScore>,
+    cancellation: Option<&CancellationToken>,
 ) -> Result<ProcessResult> {
     let path = &file.path;
     let source = path.to_string_lossy().into_owned();
@@ -115,7 +148,15 @@ async fn process_one(
             Some(score) => score,
             None => {
                 let filter_path = path.clone();
-                tokio::task::spawn_blocking(move || vision_filter::inspect(&filter_path)).await??
+                let filter_cancellation = cancellation.cloned();
+                tokio::task::spawn_blocking(move || match filter_cancellation {
+                    Some(cancellation) => {
+                        vision_filter::inspect_cancellable(&filter_path, &cancellation)
+                    }
+                    None => vision_filter::inspect(&filter_path).map(Some),
+                })
+                .await??
+                .context("image inspection was cancelled")?
             }
         };
         if !score.likely_document {
@@ -135,7 +176,7 @@ async fn process_one(
         .setting("system_prompt")?
         .unwrap_or_else(|| DEFAULT_SYSTEM_PROMPT.to_owned());
     let transcript = if is_pdf {
-        transcribe_pdf(state, path, &key, &system_prompt).await?
+        transcribe_pdf(state, path, &key, &system_prompt, cancellation).await?
     } else {
         if !state.gemini.validate_image(path, &key).await? {
             state
@@ -161,20 +202,38 @@ async fn process_one(
     Ok(ProcessResult::Processed)
 }
 
-async fn transcribe_pdf(state: &AppState, path: &Path, key: &str, prompt: &str) -> Result<String> {
+async fn transcribe_pdf(
+    state: &AppState,
+    path: &Path,
+    key: &str,
+    prompt: &str,
+    cancellation: Option<&CancellationToken>,
+) -> Result<String> {
     let count_path = path.to_path_buf();
     let pages = tokio::task::spawn_blocking(move || crate::pdf::page_count(&count_path)).await??;
+    if cancellation.is_some_and(CancellationToken::is_cancelled) {
+        anyhow::bail!("scan cancelled");
+    }
     if pages <= 10 {
         return state.gemini.transcribe_file(path, key, prompt).await;
     }
     let tempdir = tempfile::tempdir().context("creating temporary PDF page directory")?;
     let source = path.to_path_buf();
     let page_dir = tempdir.path().to_path_buf();
-    let page_paths =
-        tokio::task::spawn_blocking(move || crate::pdf::split_to_single_pages(&source, &page_dir))
-            .await??;
+    let split_cancellation = cancellation.cloned();
+    let page_paths = tokio::task::spawn_blocking(move || match split_cancellation {
+        Some(cancellation) => {
+            crate::pdf::split_to_single_pages_cancellable(&source, &page_dir, &cancellation)
+        }
+        None => crate::pdf::split_to_single_pages(&source, &page_dir).map(Some),
+    })
+    .await??
+    .context("PDF page splitting was cancelled")?;
     let mut transcripts = Vec::with_capacity(page_paths.len());
     for (index, page_path) in page_paths.iter().enumerate() {
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            anyhow::bail!("scan cancelled");
+        }
         let transcript = state.gemini.transcribe_file(page_path, key, prompt).await?;
         let page_target = page_transcript_path(path, index + 1);
         tokio::fs::write(&page_target, &transcript)
@@ -213,6 +272,11 @@ pub async fn start_job(state: &Arc<AppState>) -> Result<bool> {
     if !state.db.begin_job()? {
         return Ok(false);
     }
+    *state
+        .scan_cancellation
+        .lock()
+        .map_err(|_| anyhow::anyhow!("scan cancellation lock poisoned"))? =
+        CancellationToken::new();
     publish_status(state).await;
     if state.queue_tx.send(()).await.is_err() {
         state
@@ -220,6 +284,18 @@ pub async fn start_job(state: &Arc<AppState>) -> Result<bool> {
             .finish_job(Some("Background worker is unavailable"))?;
         anyhow::bail!("background worker is unavailable");
     }
+    Ok(true)
+}
+
+pub fn request_stop(state: &AppState) -> Result<bool> {
+    if !state.db.job_status()?.running {
+        return Ok(false);
+    }
+    state
+        .scan_cancellation
+        .lock()
+        .map_err(|_| anyhow::anyhow!("scan cancellation lock poisoned"))?
+        .cancel();
     Ok(true)
 }
 
@@ -249,7 +325,7 @@ pub async fn direct_process(state: &AppState, path: &Path) -> Result<String> {
             score.horizontal_line_rows
         )
     }).unwrap_or_default();
-    let result = match process_one(state, &one, image_score).await? {
+    let result = match process_one(state, &one, image_score, None).await? {
         ProcessResult::Processed => format!("Transcript: {}", transcript_path(path).display()),
         ProcessResult::Skipped(reason) => format!("Skipped: {reason}"),
     };

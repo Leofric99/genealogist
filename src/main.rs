@@ -26,6 +26,7 @@ use secret::SecretCipher;
 use state::AppState;
 use std::{path::PathBuf, sync::Arc};
 use tokio::sync::{broadcast, mpsc};
+use tokio_util::sync::CancellationToken;
 use tower_http::{limit::RequestBodyLimitLayer, trace::TraceLayer};
 use tracing_subscriber::EnvFilter;
 
@@ -97,6 +98,7 @@ fn build_state(
             gemini,
             queue_tx,
             progress_tx,
+            scan_cancellation: std::sync::Mutex::new(CancellationToken::new()),
         }),
         queue_rx,
     ))
@@ -127,6 +129,7 @@ async fn serve() -> Result<()> {
         .route("/partials/status", get(web::handlers::status_fragment))
         .route("/api/status", get(web::handlers::status))
         .route("/api/scan", post(web::handlers::start_scan))
+        .route("/api/scan/stop", post(web::handlers::stop_scan))
         .route(
             "/api/settings",
             get(web::handlers::get_settings).post(web::handlers::save_settings),

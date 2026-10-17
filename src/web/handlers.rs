@@ -188,6 +188,18 @@ pub async fn start_scan(State(state): State<Arc<AppState>>) -> Result<Json<Value
     }
 }
 
+pub async fn stop_scan(State(state): State<Arc<AppState>>) -> Result<Json<Value>, ApiError> {
+    if queue::request_stop(&state)? {
+        Ok(Json(
+            json!({ "stopping": true, "status": "Stop requested; cancelling the active operation" }),
+        ))
+    } else {
+        Ok(Json(
+            json!({ "stopping": false, "status": "No scan is currently running" }),
+        ))
+    }
+}
+
 pub async fn get_settings(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<SettingsResponse>, ApiError> {
@@ -250,9 +262,10 @@ pub async fn test_key(
         Some(key) => key,
         None => api_key(&state)?,
     };
-    state.gemini.test_key(&key).await?;
+    let model = state.gemini.test_key(&key).await?;
+    let message = format!("Gemini API key test succeeded using {model}");
     Ok(Json(
-        json!({ "valid": true, "message": "Gemini API key test succeeded" }),
+        json!({ "valid": true, "model": model, "message": message }),
     ))
 }
 

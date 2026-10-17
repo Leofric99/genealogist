@@ -4,6 +4,7 @@
   <div class="card">
     <div class="row">
       <button type="button" @click="startScan()" :disabled="running">Scan records directory</button>
+      <button class="danger" type="button" @click="stopScan()" :disabled="!running || stopping">Stop scan</button>
       <span class="muted">Root: <code x-text="recordsRoot"></code></span>
     </div>
     <div id="progress" class="card" hx-get="/partials/status" hx-trigger="load, every 5s" hx-swap="innerHTML" style="margin-bottom:0">
@@ -28,6 +29,7 @@
 function dashboard() {
   return {
     running: false,
+    stopping: false,
     message: "",
     connection: "Connecting to live progress…",
     recordsRoot: "/data/records",
@@ -45,6 +47,21 @@ function dashboard() {
         this.message = data.status;
         this.refresh();
       } catch (error) { this.message = error.message; }
+    },
+    async stopScan() {
+      if (!this.running || this.stopping) return;
+      if (!window.confirm("Are you sure you want to stop the directory scan and image processing?")) return;
+      this.stopping = true;
+      this.message = "Stopping scan…";
+      try {
+        const response = await fetch("/api/scan/stop", { method: "POST" });
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || "Unable to stop scan");
+        this.message = data.status;
+      } catch (error) {
+        this.stopping = false;
+        this.message = error.message;
+      }
     },
     async refresh() {
       try {
@@ -67,6 +84,7 @@ function dashboard() {
     },
     updateProgress(job) {
       this.running = job.running;
+      if (!job.running) this.stopping = false;
       const percent = job.total ? Math.min(100, Math.floor(job.processed * 100 / job.total)) : 0;
       const active = job.active || "Idle";
       document.getElementById("progress").innerHTML =

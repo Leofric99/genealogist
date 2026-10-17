@@ -3,14 +3,76 @@ use base64::{engine::general_purpose::STANDARD, Engine};
 use governor::{
     clock::DefaultClock, state::InMemoryState, DefaultDirectRateLimiter, Quota, RateLimiter,
 };
+use reqwest::StatusCode;
 use serde_json::{json, Value};
-use std::{num::NonZeroU32, path::Path, sync::Arc};
+use sha2::{Digest, Sha256};
+use std::{
+    collections::HashMap,
+    error::Error,
+    fmt,
+    num::NonZeroU32,
+    path::Path,
+    sync::{Arc, Mutex},
+};
 
 pub struct GeminiClient {
     http: reqwest::Client,
     limiter: Arc<DefaultDirectRateLimiter>,
     model: String,
     validation_model: String,
+    active_models: Mutex<HashMap<[u8; 32], String>>,
+}
+
+struct GeneratedText {
+    text: String,
+    model: String,
+}
+
+#[derive(Debug)]
+struct ModelQuotaExceeded {
+    model: String,
+    message: String,
+}
+
+impl fmt::Display for ModelQuotaExceeded {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "Gemini quota exhausted for model {}: {}",
+            self.model, self.message
+        )
+    }
+}
+
+impl Error for ModelQuotaExceeded {}
+
+fn api_key_fingerprint(key: &str) -> [u8; 32] {
+    let digest = Sha256::digest(key.as_bytes());
+    let mut fingerprint = [0_u8; 32];
+    fingerprint.copy_from_slice(&digest);
+    fingerprint
+}
+
+fn is_text_flash_model(model: &Value) -> Option<String> {
+    if !model
+        .get("supportedGenerationMethods")
+        .and_then(Value::as_array)?
+        .iter()
+        .any(|method| method.as_str() == Some("generateContent"))
+    {
+        return None;
+    }
+    let name = model.get("name")?.as_str()?;
+    let name = name.strip_prefix("models/").unwrap_or(name);
+    let normalized = name.to_ascii_lowercase();
+    if !normalized.contains("flash")
+        || ["image", "audio", "live", "tts"]
+            .iter()
+            .any(|excluded| normalized.contains(excluded))
+    {
+        return None;
+    }
+    Some(name.to_owned())
 }
 
 impl GeminiClient {
@@ -24,6 +86,7 @@ impl GeminiClient {
             limiter: Arc::new(limiter),
             model,
             validation_model,
+            active_models: Mutex::new(HashMap::new()),
         })
     }
 
@@ -32,6 +95,124 @@ impl GeminiClient {
         model: &str,
         key: &str,
         parts: Vec<Value>,
+        max_tokens: Option<u32>,
+    ) -> Result<GeneratedText> {
+        let key_fingerprint = api_key_fingerprint(key);
+        let active_model = self
+            .active_models
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Gemini model preference lock poisoned"))?
+            .get(&key_fingerprint)
+            .cloned()
+            .unwrap_or_else(|| model.to_owned());
+        match self
+            .generate_on_model(&active_model, key, &parts, max_tokens)
+            .await
+        {
+            Ok(text) => Ok(GeneratedText {
+                text,
+                model: active_model,
+            }),
+            Err(error) if error.downcast_ref::<ModelQuotaExceeded>().is_some() => {
+                let alternates = self.list_flash_models(key).await.with_context(|| {
+                    format!(
+                        "model {} hit its quota and alternate Flash models could not be listed",
+                        active_model
+                    )
+                })?;
+                let mut exhausted = vec![error.to_string()];
+                for alternate in alternates
+                    .into_iter()
+                    .filter(|alternate| alternate != &active_model)
+                {
+                    match self
+                        .generate_on_model(&alternate, key, &parts, max_tokens)
+                        .await
+                    {
+                        Ok(text) => {
+                            self.active_models
+                                .lock()
+                                .map_err(|_| {
+                                    anyhow::anyhow!("Gemini model preference lock poisoned")
+                                })?
+                                .insert(key_fingerprint, alternate.clone());
+                            tracing::warn!(
+                                previous_model = %active_model,
+                                selected_model = %alternate,
+                                "Gemini quota reached; switched to an available Flash model"
+                            );
+                            return Ok(GeneratedText {
+                                text,
+                                model: alternate,
+                            });
+                        }
+                        Err(error) if error.downcast_ref::<ModelQuotaExceeded>().is_some() => {
+                            exhausted.push(error.to_string());
+                        }
+                        Err(error) => {
+                            return Err(error).with_context(|| {
+                                format!("trying alternate Gemini Flash model {alternate}")
+                            });
+                        }
+                    }
+                }
+                anyhow::bail!(
+                    "Gemini quotas are exhausted for all available Flash models: {}",
+                    exhausted.join("; ")
+                )
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn list_flash_models(&self, key: &str) -> Result<Vec<String>> {
+        let mut models = Vec::new();
+        let mut page_token: Option<String> = None;
+        loop {
+            let mut request = self
+                .http
+                .get("https://generativelanguage.googleapis.com/v1beta/models")
+                .header("x-goog-api-key", key)
+                .query(&[("pageSize", "100")]);
+            if let Some(token) = page_token.as_deref() {
+                request = request.query(&[("pageToken", token)]);
+            }
+            let response = request
+                .send()
+                .await
+                .context("listing Gemini models available to this API key")?;
+            let status = response.status();
+            let body: Value = response.json().await.context("reading Gemini model list")?;
+            if !status.is_success() {
+                let message = body
+                    .pointer("/error/message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Gemini model listing failed");
+                anyhow::bail!("Gemini models.list returned HTTP {status}: {message}");
+            }
+            let page = body
+                .get("models")
+                .and_then(Value::as_array)
+                .context("Gemini model list contained no models array")?;
+            models.extend(page.iter().filter_map(is_text_flash_model));
+            page_token = body
+                .get("nextPageToken")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            if page_token.is_none() {
+                break;
+            }
+        }
+        models.sort();
+        models.dedup();
+        Ok(models)
+    }
+
+    async fn generate_on_model(
+        &self,
+        model: &str,
+        key: &str,
+        parts: &[Value],
         max_tokens: Option<u32>,
     ) -> Result<String> {
         self.limiter.until_ready().await;
@@ -59,6 +240,13 @@ impl GeminiClient {
                 .pointer("/error/message")
                 .and_then(Value::as_str)
                 .unwrap_or("Gemini request failed");
+            if status == StatusCode::TOO_MANY_REQUESTS {
+                return Err(ModelQuotaExceeded {
+                    model: model.to_owned(),
+                    message: message.to_owned(),
+                }
+                .into());
+            }
             anyhow::bail!("Gemini returned HTTP {status}: {message}");
         }
         if body
@@ -94,7 +282,7 @@ impl GeminiClient {
                 json!({ "inlineData": { "mimeType": mime, "data": STANDARD.encode(bytes) } }),
             ],
             None,
-        ).await?;
+        ).await?.text;
         let normalized = answer
             .trim()
             .trim_matches(|c: char| !c.is_ascii_alphabetic())
@@ -142,7 +330,7 @@ impl GeminiClient {
                 None,
             )
             .await?;
-        Ok(normalize_transcript(&raw))
+        Ok(normalize_transcript(&raw.text))
     }
 
     pub async fn consolidate(
@@ -168,10 +356,10 @@ impl GeminiClient {
                 None,
             )
             .await?;
-        Ok(normalize_transcript(&raw))
+        Ok(normalize_transcript(&raw.text))
     }
 
-    pub async fn test_key(&self, key: &str) -> Result<()> {
+    pub async fn test_key(&self, key: &str) -> Result<String> {
         let answer = self
             .generate(
                 &self.validation_model,
@@ -180,15 +368,17 @@ impl GeminiClient {
                 None,
             )
             .await?;
-        if answer.trim().is_empty() {
+        if answer.text.trim().is_empty() {
             anyhow::bail!("Gemini returned an empty test response");
         }
-        Ok(())
+        Ok(answer.model)
     }
 
     pub async fn text_prompt(&self, key: &str, prompt: &str) -> Result<String> {
-        self.generate(&self.model, key, vec![json!({ "text": prompt })], None)
-            .await
+        Ok(self
+            .generate(&self.model, key, vec![json!({ "text": prompt })], None)
+            .await?
+            .text)
     }
 }
 
@@ -280,7 +470,30 @@ fn render_transcript(metadata: &serde_yaml::Mapping, body: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_transcript;
+    use super::{is_text_flash_model, normalize_transcript};
+
+    #[test]
+    fn only_generation_capable_text_flash_models_are_fallbacks() {
+        let flash = serde_json::json!({
+            "name": "models/gemini-2.5-flash",
+            "supportedGenerationMethods": ["generateContent", "countTokens"]
+        });
+        let flash_image = serde_json::json!({
+            "name": "models/gemini-2.5-flash-image",
+            "supportedGenerationMethods": ["generateContent"]
+        });
+        let embeddings = serde_json::json!({
+            "name": "models/gemini-embedding-001",
+            "supportedGenerationMethods": ["embedContent"]
+        });
+
+        assert_eq!(
+            is_text_flash_model(&flash).as_deref(),
+            Some("gemini-2.5-flash")
+        );
+        assert_eq!(is_text_flash_model(&flash_image), None);
+        assert_eq!(is_text_flash_model(&embeddings), None);
+    }
 
     #[test]
     fn transcript_always_has_required_frontmatter_fields() {
@@ -304,5 +517,17 @@ mod tests {
             assert!(metadata.get(field).is_some(), "missing {field}");
         }
         assert!(transcript.contains("| Ada | 12 |"));
+    }
+
+    #[test]
+    fn flash_model_names_may_be_full_resource_names_or_ids() {
+        let model = serde_json::json!({
+            "name": "gemini-2.5-flash-lite",
+            "supportedGenerationMethods": ["generateContent"]
+        });
+        assert_eq!(
+            is_text_flash_model(&model).as_deref(),
+            Some("gemini-2.5-flash-lite")
+        );
     }
 }

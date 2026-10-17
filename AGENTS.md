@@ -44,4 +44,10 @@
   authentication middleware; only `/login` and `/api/login` are public.
 - Gemini requests are paced below ten requests per minute. Preserve this limit
   if adding parallel processing.
+- On Gemini HTTP 429 responses, `GeminiClient` may list generation-capable Flash
+  models for the current API key and try alternatives; only update the
+  per-key active model after an alternate succeeds. Quotas remain project-based
+  and model-specific.
+- Directory scans use a cancellation token. Keep cancellation checks in
+  filesystem traversal/hashing and make processing futures cancellable.
 - PDF operations use `lopdf`; always clean temporary page files with RAII.

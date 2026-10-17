@@ -82,5 +82,13 @@ PUID=$(id -u) PGID=$(id -g) docker compose up --build
   64-hex-character `GOS_MASTER_KEY`.
 - Gemini model names can be changed with `GEMINI_MODEL` and
   `GEMINI_VALIDATION_MODEL`.
+- On HTTP 429 quota responses, the app discovers Flash models available to the
+  configured API key and tries alternatives that support `generateContent`.
+  Successful fallback choices are reused for later requests in this process.
+  Google quotas are per project, vary by model, and daily quotas reset at
+  midnight Pacific; rotating models cannot bypass a project-wide quota.
+- An in-progress directory scan can be stopped from the dashboard. The stop
+  action cancels the current async processing operation and stops hashing
+  discovered files; already completed transcripts remain saved.
 - Geographical anomaly checks are conservative string/date heuristics, not
   geocoding. Review flagged items manually.

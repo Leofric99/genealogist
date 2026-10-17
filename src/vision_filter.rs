@@ -3,6 +3,7 @@ use image::{imageops::FilterType, DynamicImage, GrayImage, ImageReader};
 use imageproc::edges::canny;
 use serde::Serialize;
 use std::path::Path;
+use tokio_util::sync::CancellationToken;
 
 #[derive(Clone, Debug, Serialize)]
 pub struct VisionScore {
@@ -19,6 +20,24 @@ pub fn inspect(path: &Path) -> Result<VisionScore> {
         .decode()
         .with_context(|| format!("decoding image {}", path.display()))?;
     Ok(score_image(image))
+}
+
+pub fn inspect_cancellable(
+    path: &Path,
+    cancellation: &CancellationToken,
+) -> Result<Option<VisionScore>> {
+    if cancellation.is_cancelled() {
+        return Ok(None);
+    }
+    let image = ImageReader::open(path)?
+        .with_guessed_format()?
+        .decode()
+        .with_context(|| format!("decoding image {}", path.display()))?;
+    if cancellation.is_cancelled() {
+        return Ok(None);
+    }
+    let score = score_image(image);
+    Ok((!cancellation.is_cancelled()).then_some(score))
 }
 
 pub fn score_image(image: DynamicImage) -> VisionScore {

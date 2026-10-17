@@ -2,8 +2,9 @@ use crate::{
     auth::AuthManager, config::Config, db::Database, gemini_client::GeminiClient,
     secret::SecretCipher,
 };
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tokio::sync::{broadcast, mpsc};
+use tokio_util::sync::CancellationToken;
 
 pub struct AppState {
     pub config: Config,
@@ -13,6 +14,7 @@ pub struct AppState {
     pub gemini: GeminiClient,
     pub queue_tx: mpsc::Sender<()>,
     pub progress_tx: broadcast::Sender<String>,
+    pub scan_cancellation: Mutex<CancellationToken>,
 }
 
 pub fn api_key(state: &AppState) -> anyhow::Result<String> {

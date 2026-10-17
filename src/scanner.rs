@@ -7,6 +7,7 @@ use std::{
     io::Read,
     path::{Path, PathBuf},
 };
+use tokio_util::sync::CancellationToken;
 use walkdir::WalkDir;
 
 #[derive(Clone, Debug, Serialize)]
@@ -29,27 +30,54 @@ pub fn is_supported(path: &Path) -> bool {
 }
 
 pub fn scan_and_hash(root: &Path) -> Result<Vec<ScannedFile>> {
+    scan_and_hash_inner(root, None)?.context("directory scan was unexpectedly cancelled")
+}
+
+pub fn scan_and_hash_cancellable(
+    root: &Path,
+    cancellation: &CancellationToken,
+) -> Result<Option<Vec<ScannedFile>>> {
+    scan_and_hash_inner(root, Some(cancellation))
+}
+
+fn scan_and_hash_inner(
+    root: &Path,
+    cancellation: Option<&CancellationToken>,
+) -> Result<Option<Vec<ScannedFile>>> {
     if !root.is_dir() {
         anyhow::bail!(
             "records directory does not exist or is not a directory: {}",
             root.display()
         );
     }
-    let paths = WalkDir::new(root)
-        .follow_links(false)
-        .into_iter()
-        .filter_map(|entry| match entry {
-            Ok(entry) if entry.file_type().is_file() && is_supported(entry.path()) => {
-                Some(Ok(entry.into_path()))
-            }
-            Ok(_) => None,
-            Err(error) => Some(Err(anyhow::anyhow!(error))),
-        })
+    let mut paths = Vec::new();
+    for entry in WalkDir::new(root).follow_links(false) {
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return Ok(None);
+        }
+        let entry = entry?;
+        if entry.file_type().is_file() && is_supported(entry.path()) {
+            paths.push(entry.into_path());
+        }
+    }
+    let files = paths
+        .par_iter()
+        .map(|path| hash_file_inner(path, cancellation))
         .collect::<Result<Vec<_>>>()?;
-    paths.par_iter().map(|path| hash_file(path)).collect()
+    if cancellation.is_some_and(CancellationToken::is_cancelled) {
+        return Ok(None);
+    }
+    Ok(Some(files.into_iter().flatten().collect()))
 }
 
 pub fn hash_file(path: &Path) -> Result<ScannedFile> {
+    hash_file_inner(path, None)?.context("file hashing was unexpectedly cancelled")
+}
+
+fn hash_file_inner(
+    path: &Path,
+    cancellation: Option<&CancellationToken>,
+) -> Result<Option<ScannedFile>> {
     if !path.is_file() || !is_supported(path) {
         anyhow::bail!("not a supported document file: {}", path.display());
     }
@@ -57,6 +85,9 @@ pub fn hash_file(path: &Path) -> Result<ScannedFile> {
     let mut digest = Sha256::new();
     let mut buffer = [0_u8; 64 * 1024];
     loop {
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return Ok(None);
+        }
         let read = file
             .read(&mut buffer)
             .with_context(|| format!("reading {}", path.display()))?;
@@ -65,7 +96,7 @@ pub fn hash_file(path: &Path) -> Result<ScannedFile> {
         }
         digest.update(&buffer[..read]);
     }
-    Ok(ScannedFile {
+    Ok(Some(ScannedFile {
         path: path.to_path_buf(),
         sha256: hex::encode(digest.finalize()),
         extension: path
@@ -73,5 +104,22 @@ pub fn hash_file(path: &Path) -> Result<ScannedFile> {
             .and_then(|ext| ext.to_str())
             .unwrap_or("")
             .to_ascii_lowercase(),
-    })
+    }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::scan_and_hash_cancellable;
+    use tokio_util::sync::CancellationToken;
+
+    #[test]
+    fn cancelled_directory_scan_returns_no_partial_results() {
+        let directory = tempfile::tempdir().unwrap();
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+
+        assert!(scan_and_hash_cancellable(directory.path(), &cancellation)
+            .unwrap()
+            .is_none());
+    }
 }
