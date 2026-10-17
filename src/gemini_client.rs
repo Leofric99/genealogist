@@ -93,7 +93,7 @@ impl GeminiClient {
                 json!({ "text": "Classify this image. Is it primarily a scanned or photographed historical text document (not a general photo)? Reply with exactly one word: DOCUMENT or PHOTO." }),
                 json!({ "inlineData": { "mimeType": mime, "data": STANDARD.encode(bytes) } }),
             ],
-            Some(1),
+            None,
         ).await?;
         let normalized = answer
             .trim()
@@ -177,7 +177,7 @@ impl GeminiClient {
                 &self.validation_model,
                 key,
                 vec![json!({ "text": "Reply with OK." })],
-                Some(2),
+                None,
             )
             .await?;
         if answer.trim().is_empty() {
