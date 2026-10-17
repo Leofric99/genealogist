@@ -10,13 +10,21 @@
 - Transcripts use YAML frontmatter followed by Markdown and are stored beside
   the source image/PDF. Do not overwrite a transcript for a file whose content
   hash has not changed.
+- Keep the default transcription prompt format-agnostic. Its table guidance
+  should preserve source row/column relationships, require consistent cell
+  counts, and use compact Markdown separators rather than content-width padding.
+- When changing the built-in prompt, migrate only an exact match of the prior
+  built-in text so saved custom prompts remain untouched.
+- Life story source matching lives in `src/web/story_sources.rs`; keep fuzzy
+  name matches dependent on independent GEDCOM/transcript/path corroboration.
+  `src/web/story_format.rs` validates per-section confidence and transcript
+  citations before a generated biography is saved.
 - Gemini credentials are encrypted before they are stored in SQLite. Preserve
   `GOS_MASTER_KEY` key stability or the local `.encryption-key` file when
   persisting the database.
 - Queue progress is broadcast to WebSocket clients and can be recovered from
-  SQLite after a server restart. The latest 100 timestamped activity events are
-  retained in memory for browser reconnects; keep the WebSocket event envelope
-  (`type: status` or `type: log`) consistent with the dashboard.
+  SQLite after a server restart. Keep the WebSocket status event consistent
+  with the dashboard.
 - Hidden dot-prefixed files and directories are excluded from recursive scans.
   The clear-index operation removes only SQLite file rows and resets counters;
   it must preserve originals and sidecar transcripts.
@@ -49,13 +57,13 @@
 - Keep all web routes (including REST APIs and WebSockets) behind the session
   authentication middleware; only `/login` and `/api/login` are public.
 - Gemini requests are paced below ten requests per minute. Preserve this limit
-  if adding parallel processing.
+  if adding parallel processing. The scan worker runs at most four independent
+  source-output groups concurrently and shares one Gemini rate limiter across
+  all requests.
 - On Gemini HTTP 429 responses, `GeminiClient` may list generation-capable Flash
   models for the current API key and try alternatives; only update the
   per-key active model after an alternate succeeds. Quotas remain project-based
   and model-specific.
 - Directory scans use a cancellation token. Keep cancellation checks in
   filesystem traversal/hashing and make processing futures cancellable.
-- Gemini request and scan outcomes should be published to the activity feed;
-  render user-controlled/event text with DOM `textContent` rather than HTML.
 - PDF operations use `lopdf`; always clean temporary page files with RAII.

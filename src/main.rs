@@ -98,7 +98,6 @@ fn build_state(
             gemini,
             queue_tx,
             progress_tx,
-            activity_log: std::sync::Mutex::new(std::collections::VecDeque::new()),
             scan_cancellation: std::sync::Mutex::new(CancellationToken::new()),
         }),
         queue_rx,

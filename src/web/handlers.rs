@@ -5,6 +5,10 @@ use crate::{
     gedcom::{parser, rules},
     queue,
     state::{api_key, AppState},
+    web::{
+        story_format,
+        story_sources::{self, PersonIdentity},
+    },
 };
 use axum::{
     body::Body,
@@ -207,10 +211,6 @@ pub async fn clear_index(State(state): State<Arc<AppState>>) -> Result<Json<Valu
             "Stop the running scan before clearing the index".to_owned(),
         ));
     }
-    queue::publish_log(
-        &state,
-        "Cleared the indexed file list; source files and transcripts were preserved",
-    );
     queue::publish_status(&state).await;
     Ok(Json(json!({
         "cleared": true,
@@ -428,10 +428,34 @@ pub async fn generate_story(
         )
     })?;
     let name = person.name.unwrap_or("Unknown individual");
+    let identity = PersonIdentity {
+        name: name.to_owned(),
+        birth_year: person
+            .birth
+            .as_ref()
+            .and_then(|event| event.date)
+            .and_then(parser::date_year),
+        birth_place: person
+            .birth
+            .as_ref()
+            .and_then(|event| event.place)
+            .map(str::to_owned),
+        event_years: person
+            .events
+            .iter()
+            .filter_map(|event| event.date.and_then(parser::date_year))
+            .collect(),
+        event_places: person
+            .events
+            .iter()
+            .filter_map(|event| event.place.map(str::to_owned))
+            .collect(),
+    };
     let records = state.config.records_dir.clone();
-    let name = name.to_owned();
-    let sources =
-        tokio::task::spawn_blocking(move || collect_person_sources(&records, &name)).await??;
+    let sources = tokio::task::spawn_blocking(move || {
+        story_sources::collect_person_sources(&records, &identity)
+    })
+    .await??;
     if sources.is_empty() {
         return Err(ApiError(
             StatusCode::BAD_REQUEST,
@@ -441,29 +465,36 @@ pub async fn generate_story(
     let facts = person_facts(person, &graph);
     let source_text = sources
         .iter()
-        .map(|(relative, content)| format!("SOURCE: {relative}\nTRANSCRIPTION:\n{content}"))
+        .map(|source| {
+            format!(
+                "SOURCE: {}\nHEURISTIC MATCH EVIDENCE: {}\nTRANSCRIPTION:\n{}",
+                source.relative_path,
+                source.match_evidence.join("; "),
+                source.contents
+            )
+        })
         .collect::<Vec<_>>()
         .join("\n\n---\n\n");
     let allowed_sources = sources
         .iter()
-        .map(|(relative, _)| format!("- {relative}"))
+        .map(|source| format!("- {}", source.relative_path))
         .collect::<Vec<_>>()
         .join("\n");
     let prompt = format!(
-        "Write a clear chronological biography using only the supplied GEDCOM facts and transcriptions. Cite every material historical claim inline with a Markdown link to its source transcript, using exactly the relative paths listed below. Do not fabricate facts. Explain conflicting evidence and uncertainty. Include a Sources section.\n\nPERSON FACTS:\n{facts}\n\nALLOWED TRANSCRIPT SOURCE PATHS:\n{allowed_sources}\n\nTRANSCRIPTIONS:\n{source_text}"
+        "Write a clear chronological biography using only the supplied GEDCOM facts and transcriptions. Use Markdown section headings (## or deeper). Immediately after every section heading, with no blank line between, put a line formatted exactly **Confidence: NN%**. This percentage is a qualitative estimate of how strongly the cited evidence supports the claims in that section, not statistical certainty. Cite every historical or biographical claim with an inline Markdown link to one or more source transcripts, using exactly the relative paths listed below. Put each factual sentence or list item on its own line and cite it on that same line; do not leave factual introductory or concluding text uncited. Do not make unsupported claims. Explain conflicting evidence and uncertainty. Heuristic source-match evidence is not proof of identity: compare names, dates, ages, places, and other facts before attributing a source to the subject. If identity remains uncertain, say so and lower the section confidence. Include a Sources section whose entries link to the cited transcripts. Return only the biography.\n\nPERSON FACTS:\n{facts}\n\nALLOWED TRANSCRIPT SOURCE PATHS:\n{allowed_sources}\n\nTRANSCRIPTIONS:\n{source_text}"
     );
     let key = api_key(&state)?;
     let story = state.gemini.text_prompt(&key, &prompt).await?;
-    let has_source_citation = sources.iter().any(|(relative, _)| {
-        story.contains(&format!("]({relative})")) || story.contains(&format!("](<{relative}>)"))
-    });
-    if !has_source_citation {
-        return Err(ApiError(
+    let allowed_paths = sources
+        .iter()
+        .map(|source| source.relative_path.clone())
+        .collect::<Vec<_>>();
+    story_format::validate(&story, &allowed_paths).map_err(|error| {
+        ApiError(
             StatusCode::BAD_GATEWAY,
-            "Gemini biography did not cite a matching transcript path; no file was written"
-                .to_owned(),
-        ));
-    }
+            format!("Gemini biography failed citation/confidence validation: {error}; no file was written"),
+        )
+    })?;
     let identifier = safe_component(&xref);
     let stories = state.config.output_dir.join("stories");
     let output = if request.destination.as_deref() == Some("person") {
@@ -475,7 +506,20 @@ pub async fn generate_story(
         tokio::fs::create_dir_all(parent).await?;
     }
     tokio::fs::write(&output, story).await?;
-    Ok(Json(json!({ "path": output, "sources": sources.len() })))
+    let matched_sources = sources
+        .iter()
+        .map(|source| {
+            json!({
+                "path": source.relative_path,
+                "evidence": source.match_evidence,
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(Json(json!({
+        "path": output,
+        "sources": sources.len(),
+        "matched_sources": matched_sources,
+    })))
 }
 
 fn data_directory(state: &AppState) -> PathBuf {
@@ -507,58 +551,10 @@ fn collect_frontmatter(records: &Path) -> anyhow::Result<String> {
     Ok(facts.join("\n\n"))
 }
 
-fn collect_person_sources(records: &Path, name: &str) -> anyhow::Result<Vec<(String, String)>> {
-    let mut matches = Vec::new();
-    if !records.is_dir() {
-        return Ok(matches);
-    }
-    let needle = normalize_name(name);
-    for entry in walkdir::WalkDir::new(records).follow_links(false) {
-        let entry = entry?;
-        if !entry.file_type().is_file()
-            || entry.path().extension().and_then(|ext| ext.to_str()) != Some("md")
-        {
-            continue;
-        }
-        let text = fs::read_to_string(entry.path())?;
-        let Some(yaml) = frontmatter(&text) else {
-            continue;
-        };
-        let parsed: serde_yaml::Value = match serde_yaml::from_str(yaml) {
-            Ok(value) => value,
-            Err(_) => continue,
-        };
-        let serialized = parsed
-            .get("primary_individuals")
-            .map(|value| serde_yaml::to_string(value).unwrap_or_default())
-            .unwrap_or_default();
-        if normalize_name(&serialized).contains(&needle) {
-            let relative = entry
-                .path()
-                .strip_prefix(records)?
-                .to_string_lossy()
-                .replace('\\', "/");
-            matches.push((relative, text));
-        }
-    }
-    Ok(matches)
-}
-
 fn frontmatter(text: &str) -> Option<&str> {
     let content = text.strip_prefix("---")?;
     let end = content.find("\n---")?;
     Some(&content[..end])
-}
-
-fn normalize_name(value: &str) -> String {
-    value
-        .chars()
-        .filter(|ch| ch.is_alphanumeric() || ch.is_whitespace())
-        .flat_map(char::to_lowercase)
-        .collect::<String>()
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
 }
 
 fn person_facts(

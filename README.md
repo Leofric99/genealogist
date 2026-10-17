@@ -96,6 +96,10 @@ PUID=$(id -u) PGID=$(id -g) docker compose up --build
   PDFs bypass photo filtering. PDFs over ten pages are transcribed page by page
   before a consolidation pass.
 - Transcripts and page-level transcripts are written beside the source file.
+- The default transcription prompt preserves table columns, row alignment,
+  empty cells, and source order without assuming a particular document type.
+  Existing saved copies of the previous built-in prompt are upgraded on
+  startup; custom prompts are left unchanged.
 - API keys are encrypted in SQLite using a local encryption key. Back up the
   `.encryption-key` file along with the database; alternatively supply a stable
   64-hex-character `GOS_MASTER_KEY`.
@@ -109,12 +113,17 @@ PUID=$(id -u) PGID=$(id -g) docker compose up --build
 - An in-progress directory scan can be stopped from the dashboard. The stop
   action cancels the current async processing operation and stops hashing
   discovered files; already completed transcripts remain saved.
+- Scans process up to four independent transcript-output groups concurrently.
+  Requests still share the Gemini client's limiter of nine requests per minute;
+  files that would write to the same Markdown sidecar are kept sequential.
 - Dot-prefixed files and directories are excluded from scans. Use **Clear
   indexed files** on the dashboard to reset the SQLite file index; this preserves
   source documents and all transcripts. Existing transcripts will still be
   detected and skipped during a subsequent scan.
-- The dashboard's **Live activity** feed shows timestamped scan and Gemini
-  request events. The latest 100 events are retained in memory for reconnecting
-  browser sessions; persisted job progress remains available from SQLite.
 - Geographical anomaly checks are conservative string/date heuristics, not
   geocoding. Review flagged items manually.
+- Life story source selection can tolerate OCR name variants when other evidence
+  corroborates the match; the audit page shows the selected transcripts and
+  matching clues. Review those sources and the generated citations. See
+  [Life story source matching](./docs/lifestory-source-matching.md) for the
+  scoring signals and limitations.

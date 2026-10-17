@@ -22,7 +22,7 @@
   </div>
   <div class="card">
     <h2>Life story biography</h2>
-    <p class="muted">Enter a GEDCOM individual identifier (for example, @I12@). Generated claims must cite matching transcript files.</p>
+    <p class="muted">Enter a GEDCOM individual identifier (for example, @I12@). Each section shows evidence confidence; every factual line must cite a selected transcript. Name variants are matched only when other record evidence supports them.</p>
     <form @submit.prevent="story()">
       <label>Individual ID
         <input type="text" x-model="personId" placeholder="@I12@" required>
@@ -36,13 +36,21 @@
       <button type="submit" :disabled="busy">Generate biography</button>
     </form>
     <p class="muted" x-text="storyMessage"></p>
+    <div x-show="storySources.length">
+      <h3>Selected transcript sources</h3>
+      <ul>
+        <template x-for="source in storySources" :key="source.path">
+          <li><code x-text="source.path"></code> <span class="muted" x-text="`— ${source.evidence.join('; ')}`"></span></li>
+        </template>
+      </ul>
+    </div>
   </div>
 </section>
 <script>
 function auditPage() {
   return {
     busy: false, uploadMessage: "", message: "", result: "", anomalyCount: 0,
-    personId: "", destination: "central", storyMessage: "",
+    personId: "", destination: "central", storyMessage: "", storySources: [],
     async upload() {
       this.busy = true; this.uploadMessage = "Uploading…";
       try {
@@ -69,6 +77,7 @@ function auditPage() {
     },
     async story() {
       this.busy = true; this.storyMessage = "Generating cited biography…";
+      this.storySources = [];
       try {
         const response = await fetch(`/api/story/${encodeURIComponent(this.personId)}`, {
           method: "POST", headers: { "Content-Type": "application/json" },
@@ -76,6 +85,7 @@ function auditPage() {
         });
         const data = await response.json();
         if (!response.ok) throw new Error(data.error || "Biography generation failed");
+        this.storySources = data.matched_sources || [];
         this.storyMessage = `Saved to ${data.path} using ${data.sources} transcript source(s).`;
       } catch (error) { this.storyMessage = error.message; }
       finally { this.busy = false; }

@@ -16,11 +16,6 @@
     <p id="message" class="notice" x-show="message" x-text="message"></p>
   </div>
   <div class="card">
-    <h2>Live activity</h2>
-    <p id="activity-empty" class="muted">Waiting for activity…</p>
-    <ol id="activity-log" class="activity-log" aria-live="polite"></ol>
-  </div>
-  <div class="card">
     <h2>Indexed files</h2>
     <p class="muted">Files with unchanged checksums and matching transcripts are skipped. Failed files remain visible for troubleshooting and are retried on the next scan.</p>
     <div style="overflow-x:auto">
@@ -101,25 +96,8 @@ function dashboard() {
         try {
           const data = JSON.parse(event.data);
           if (data.type === "status") this.updateProgress(data.job);
-          else if (data.type === "log") this.addLog(data);
         } catch (_) {}
       };
-    },
-    addLog(event) {
-      const list = document.getElementById("activity-log");
-      const empty = document.getElementById("activity-empty");
-      if (!list || !empty) return;
-      empty.hidden = true;
-      const item = document.createElement("li");
-      const timestamp = document.createElement("time");
-      const date = new Date(Number(event.timestamp));
-      timestamp.dateTime = date.toISOString();
-      timestamp.textContent = date.toLocaleString();
-      const message = document.createElement("span");
-      message.textContent = event.message;
-      item.append(timestamp, message);
-      list.prepend(item);
-      while (list.children.length > 100) list.lastElementChild.remove();
     },
     updateProgress(job) {
       this.running = job.running;

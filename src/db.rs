@@ -1,3 +1,4 @@
+use crate::config::{DEFAULT_SYSTEM_PROMPT, LEGACY_DEFAULT_SYSTEM_PROMPT};
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
@@ -61,6 +62,10 @@ impl Database {
                  message TEXT
              );
              INSERT OR IGNORE INTO job (id) VALUES (1);",
+        )?;
+        connection.execute(
+            "UPDATE settings SET value = ?1 WHERE key = 'system_prompt' AND value = ?2",
+            params![DEFAULT_SYSTEM_PROMPT, LEGACY_DEFAULT_SYSTEM_PROMPT],
         )?;
         Ok(Self {
             connection: Mutex::new(connection),
@@ -231,7 +236,38 @@ impl Database {
 
 #[cfg(test)]
 mod tests {
+    use crate::config::{DEFAULT_SYSTEM_PROMPT, LEGACY_DEFAULT_SYSTEM_PROMPT};
+
     use super::Database;
+
+    #[test]
+    fn opening_database_updates_only_the_previous_default_prompt() {
+        let directory = tempfile::tempdir().expect("temporary database directory");
+        let path = directory.path().join("genealogy.sqlite3");
+        {
+            let database = Database::open(&path).expect("open database");
+            database
+                .set_setting("system_prompt", LEGACY_DEFAULT_SYSTEM_PROMPT)
+                .expect("save previous default prompt");
+        }
+        let database = Database::open(&path).expect("reopen database");
+        assert_eq!(
+            database.setting("system_prompt").expect("read prompt"),
+            Some(DEFAULT_SYSTEM_PROMPT.to_owned())
+        );
+
+        database
+            .set_setting("system_prompt", "custom prompt")
+            .expect("save custom prompt");
+        drop(database);
+        let database = Database::open(&path).expect("reopen with custom prompt");
+        assert_eq!(
+            database
+                .setting("system_prompt")
+                .expect("read custom prompt"),
+            Some("custom prompt".to_owned())
+        );
+    }
 
     #[test]
     fn clear_file_index_preserves_settings_and_transcripts_and_rejects_running_jobs() {

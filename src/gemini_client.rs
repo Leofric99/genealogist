@@ -445,19 +445,19 @@ fn ensure_metadata_fields(metadata: &mut serde_yaml::Mapping) {
     {
         for individual in individuals {
             if let serde_yaml::Value::String(name) = individual {
-                let mut person = serde_yaml::Mapping::new();
-                person.insert(
-                    serde_yaml::Value::String("name".to_owned()),
-                    serde_yaml::Value::String(name.clone()),
-                );
-                *individual = serde_yaml::Value::Mapping(person);
+            let mut person = serde_yaml::Mapping::new();
+            person.insert(
+                serde_yaml::Value::String("name".to_owned()),
+                serde_yaml::Value::String(name.clone()),
+            );
+            *individual = serde_yaml::Value::Mapping(person);
             }
             if let serde_yaml::Value::Mapping(person) = individual {
-                for key in ["name", "role", "age", "occupation", "birthplace"] {
-                    person
-                        .entry(serde_yaml::Value::String(key.to_owned()))
-                        .or_insert(serde_yaml::Value::Null);
-                }
+            for key in ["name", "role", "age", "occupation", "birthplace"] {
+                person
+                    .entry(serde_yaml::Value::String(key.to_owned()))
+                    .or_insert(serde_yaml::Value::Null);
+            }
             }
         }
     }

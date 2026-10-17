@@ -6,14 +6,17 @@ use crate::{
     vision_filter,
 };
 use anyhow::{Context, Result};
+use futures_util::{stream, StreamExt};
 use std::{
+    collections::BTreeMap,
     path::{Path, PathBuf},
     sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
+
+const MAX_PARALLEL_FILES: usize = 4;
 
 pub fn spawn_worker(state: Arc<AppState>, mut receiver: mpsc::Receiver<()>) {
     tokio::spawn(async move {
@@ -38,7 +41,6 @@ pub async fn run_scan(state: Arc<AppState>) -> Result<()> {
         .map_err(|_| anyhow::anyhow!("scan cancellation lock poisoned"))?
         .clone();
     state.db.reset_job_progress()?;
-    publish_log(&state, "Directory scan started");
     publish_status(&state).await;
     let root = state.config.records_dir.clone();
     let scan_cancellation = cancellation.clone();
@@ -49,65 +51,72 @@ pub async fn run_scan(state: Arc<AppState>) -> Result<()> {
     let Some(files) = files else {
         return finish_stopped_scan(&state).await;
     };
-    publish_log(
-        &state,
-        &format!(
-            "Discovered {} supported files and completed hashing",
-            files.len()
-        ),
-    );
     state.db.update_job(Some(files.len()), 0, 0, None, None)?;
     publish_status(&state).await;
 
+    let mut output_groups = BTreeMap::<String, Vec<ScannedFile>>::new();
     for file in files {
-        if cancellation.is_cancelled() {
-            return finish_stopped_scan(&state).await;
-        }
-        let source = file.path.to_string_lossy().into_owned();
-        publish_log(&state, &format!("Processing {source}"));
-        state.db.update_job(None, 0, 0, Some(&source), None)?;
-        publish_status(&state).await;
-        let result = tokio::select! {
-            biased;
-            _ = cancellation.cancelled() => {
-                return finish_stopped_scan(&state).await;
-            }
-            result = process_one(&state, &file, None, Some(&cancellation)) => result,
-        };
-        match result {
-            Ok(ProcessResult::Processed) => {
-                publish_log(&state, &format!("Completed processing {source}"));
-                state.db.update_job(None, 1, 0, None, None)?;
-            }
-            Ok(ProcessResult::Skipped(reason)) => {
-                publish_log(&state, &format!("Skipped {source}: {reason}"));
-                state.db.update_job(None, 1, 1, None, Some(&reason))?;
-            }
-            Err(error) => {
-                let message = format!("{error:#}");
-                error!(path = %file.path.display(), %message, "document processing failed");
-                publish_log(&state, &format!("Error processing {source}: {message}"));
+        let output = transcript_path(&file.path);
+        output_groups
+            .entry(output.to_string_lossy().to_lowercase())
+            .or_default()
+            .push(file);
+    }
+    let active_label = format!("Processing up to {MAX_PARALLEL_FILES} documents concurrently");
+    let jobs = stream::iter(output_groups.into_values().map(|group| {
+        let state = Arc::clone(&state);
+        let active_label = active_label.clone();
+        let cancellation = cancellation.clone();
+        async move {
+            for file in group {
+                let source = file.path.to_string_lossy().into_owned();
+                state.db.update_job(None, 0, 0, Some(&active_label), None)?;
+                publish_status(&state).await;
+                let result = process_one(&state, &file, None, Some(&cancellation)).await;
+                let (skipped, message) = match result {
+                    Ok(ProcessResult::Processed) => (0, None),
+                    Ok(ProcessResult::Skipped(reason)) => (1, Some(reason)),
+                    Err(error) => {
+                        let message = format!("{error:#}");
+                        error!(path = %file.path.display(), %message, "document processing failed");
+                        state
+                            .db
+                            .save_file(&source, &file.sha256, "error", None, Some(&message))?;
+                        (0, Some(message))
+                    }
+                };
                 state
                     .db
-                    .save_file(&source, &file.sha256, "error", None, Some(&message))?;
-                state.db.update_job(None, 1, 0, None, Some(&message))?;
+                    .update_job(None, 1, skipped, Some(&active_label), message.as_deref())?;
+                publish_status(&state).await;
             }
+            Ok::<_, anyhow::Error>(())
         }
-        publish_status(&state).await;
+    }))
+    .buffer_unordered(MAX_PARALLEL_FILES);
+    tokio::pin!(jobs);
+    loop {
+        let next = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => return finish_stopped_scan(&state).await,
+            next = jobs.next() => next,
+        };
+        let Some(result) = next else {
+            break;
+        };
+        result?;
     }
 
     if cancellation.is_cancelled() {
         return finish_stopped_scan(&state).await;
     }
     state.db.finish_job(Some("Scan complete"))?;
-    publish_log(&state, "Directory scan completed");
     publish_status(&state).await;
     Ok(())
 }
 
 async fn finish_stopped_scan(state: &AppState) -> Result<()> {
     state.db.finish_job(Some("Scan stopped by user"))?;
-    publish_log(state, "Directory scan stopped by user");
     publish_status(state).await;
     Ok(())
 }
@@ -193,15 +202,7 @@ async fn process_one(
     let transcript = if is_pdf {
         transcribe_pdf(state, path, &key, &system_prompt, cancellation).await?
     } else {
-        publish_log(
-            state,
-            &format!("Sent image validation API request to Gemini for {source}"),
-        );
         let is_document = state.gemini.validate_image(path, &key).await?;
-        publish_log(
-            state,
-            &format!("Received image validation API response from Gemini for {source}"),
-        );
         if !is_document {
             state
                 .db
@@ -210,19 +211,10 @@ async fn process_one(
                 "Gemini classified image as a photo".to_owned(),
             ));
         }
-        publish_log(
-            state,
-            &format!("Sent transcription API request to Gemini for {source}"),
-        );
-        let transcript = state
+        state
             .gemini
             .transcribe_file(path, &key, &system_prompt)
-            .await?;
-        publish_log(
-            state,
-            &format!("Received transcription API response from Gemini for {source}"),
-        );
-        transcript
+            .await?
     };
 
     tokio::fs::write(&transcript_path, transcript)
@@ -248,17 +240,7 @@ async fn transcribe_pdf(
         anyhow::bail!("scan cancelled");
     }
     if pages <= 10 {
-        let source = path.to_string_lossy();
-        publish_log(
-            state,
-            &format!("Sent transcription API request to Gemini for {source}"),
-        );
-        let transcript = state.gemini.transcribe_file(path, key, prompt).await?;
-        publish_log(
-            state,
-            &format!("Received transcription API response from Gemini for {source}"),
-        );
-        return Ok(transcript);
+        return state.gemini.transcribe_file(path, key, prompt).await;
     }
     let tempdir = tempfile::tempdir().context("creating temporary PDF page directory")?;
     let source = path.to_path_buf();
@@ -277,41 +259,14 @@ async fn transcribe_pdf(
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
             anyhow::bail!("scan cancelled");
         }
-        let source = path.to_string_lossy();
-        publish_log(
-            state,
-            &format!(
-                "Sent transcription API request to Gemini for {source} (page {}/{})",
-                index + 1,
-                page_paths.len()
-            ),
-        );
         let transcript = state.gemini.transcribe_file(page_path, key, prompt).await?;
-        publish_log(
-            state,
-            &format!(
-                "Received transcription API response from Gemini for {source} (page {}/{})",
-                index + 1,
-                page_paths.len()
-            ),
-        );
         let page_target = page_transcript_path(path, index + 1);
         tokio::fs::write(&page_target, &transcript)
             .await
             .with_context(|| format!("writing page transcript {}", page_target.display()))?;
         transcripts.push(transcript);
     }
-    let source = path.to_string_lossy();
-    publish_log(
-        state,
-        &format!("Sent transcription consolidation request to Gemini for {source}"),
-    );
-    let master = state.gemini.consolidate(&transcripts, key, prompt).await?;
-    publish_log(
-        state,
-        &format!("Received transcription consolidation response from Gemini for {source}"),
-    );
-    Ok(master)
+    state.gemini.consolidate(&transcripts, key, prompt).await
 }
 
 fn transcript_path(source: &Path) -> PathBuf {
@@ -338,35 +293,6 @@ pub async fn publish_status(state: &AppState) {
             Err(error) => warn!(%error, "could not serialize job progress"),
         },
         Err(error) => warn!(%error, "could not read persisted job progress"),
-    }
-}
-
-pub fn publish_log(state: &AppState, message: &str) {
-    let timestamp = match SystemTime::now().duration_since(UNIX_EPOCH) {
-        Ok(timestamp) => timestamp.as_millis(),
-        Err(error) => {
-            warn!(%error, "could not timestamp activity log event");
-            return;
-        }
-    };
-    match serde_json::to_string(&serde_json::json!({
-        "type": "log",
-        "timestamp": timestamp,
-        "message": message,
-    })) {
-        Ok(event) => {
-            match state.activity_log.lock() {
-                Ok(mut history) => {
-                    if history.len() == 100 {
-                        history.pop_front();
-                    }
-                    history.push_back(event.clone());
-                }
-                Err(error) => warn!(%error, "could not retain activity log event"),
-            }
-            let _ = state.progress_tx.send(event);
-        }
-        Err(error) => warn!(%error, "could not serialize activity log event"),
     }
 }
 
