@@ -26,6 +26,12 @@
   precedence for saved credentials.
 - `GOS_MASTER_KEY` may be a 64-character hexadecimal encryption key. If unset,
   a local key is generated in the database directory.
+- `GOS_USERNAME` and `GOS_PASSWORD` are required to start the web server. The
+  password must be 16-4096 characters. Web sessions are HttpOnly, SameSite=Strict
+  cookies held in memory and expire after 12 hours.
+- Docker Compose binds to `127.0.0.1` by default. `HOST_BIND_IP` can select a
+  host interface, but only use non-loopback bindings on trusted private networks.
+  The app uses HTTP; never expose it directly to the public internet.
 
 ## Validation and safety
 
@@ -34,7 +40,8 @@
   requires it; sanitize GEDCOM identifiers before using them in output paths.
 - Treat GEDCOM and OCR input as untrusted. Do not execute document content or
   expose API keys in HTML, logs, or error messages.
+- Keep all web routes (including REST APIs and WebSockets) behind the session
+  authentication middleware; only `/login` and `/api/login` are public.
 - Gemini requests are paced below ten requests per minute. Preserve this limit
   if adding parallel processing.
 - PDF operations use `lopdf`; always clean temporary page files with RAII.
-

@@ -40,8 +40,14 @@
 <body>
   <header>
     <strong>Genealogy-OCR-Studio</strong>
-    <nav><a href="/">Dashboard</a><a href="/settings">Settings</a><a href="/audit">GEDCOM audit</a></nav>
+    <nav>{{navigation}}</nav>
   </header>
   <main>{{content}}</main>
+  <script>
+    async function signOut() {
+      await fetch("/api/logout", { method: "POST" });
+      window.location.replace("/login");
+    }
+  </script>
 </body>
 </html>

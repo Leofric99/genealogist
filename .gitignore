@@ -17,6 +17,7 @@ target
 /output/
 *.sqlite3
 *.encryption-key
+.env
 /data/
 /research/
 /output/

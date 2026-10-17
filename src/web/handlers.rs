@@ -1,4 +1,5 @@
 use crate::{
+    auth::AuthManager,
     config::DEFAULT_SYSTEM_PROMPT,
     db::{FileStatus, JobStatus},
     gedcom::{parser, rules},
@@ -6,8 +7,11 @@ use crate::{
     state::{api_key, AppState},
 };
 use axum::{
+    body::Body,
     extract::{Multipart, Path as AxumPath, State},
-    http::StatusCode,
+    http::{header, HeaderValue, Request, StatusCode},
+    middleware::Next,
+    response::{IntoResponse, Redirect, Response},
     Json,
 };
 use serde::{Deserialize, Serialize};
@@ -45,6 +49,108 @@ pub struct TestKeyRequest {
 #[derive(Deserialize)]
 pub struct StoryRequest {
     pub destination: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct LoginRequest {
+    pub username: String,
+    pub password: String,
+}
+
+pub async fn require_login(
+    State(state): State<Arc<AppState>>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    let path = request.uri().path().to_owned();
+    if path == "/login" || path == "/api/login" {
+        return next.run(request).await;
+    }
+    let Some(auth) = state.auth.as_deref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": "Web authentication is not configured" })),
+        )
+            .into_response();
+    };
+    if let Some(token) = session_cookie(&request) {
+        match auth.valid_session(token) {
+            Ok(true) => return next.run(request).await,
+            Ok(false) => {}
+            Err(error) => {
+                tracing::error!(%error, "validating web session failed");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({ "error": "Could not validate the web session" })),
+                )
+                    .into_response();
+            }
+        }
+    }
+    if path.starts_with("/api/") || path == "/ws" {
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "Authentication required" })),
+        )
+            .into_response()
+    } else {
+        Redirect::to("/login").into_response()
+    }
+}
+
+pub async fn login(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<LoginRequest>,
+) -> Result<Response, ApiError> {
+    let Some(auth) = state.auth.as_ref() else {
+        return Err(ApiError(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Web authentication is not configured".to_owned(),
+        ));
+    };
+    let Some(token) = auth
+        .authenticate(&request.username, &request.password)
+        .await?
+    else {
+        return Err(ApiError(
+            StatusCode::UNAUTHORIZED,
+            "Invalid username or password".to_owned(),
+        ));
+    };
+    let cookie = HeaderValue::from_str(&format!(
+        "gos_session={token}; Path=/; Max-Age={}; HttpOnly; SameSite=Strict",
+        12 * 60 * 60
+    ))
+    .map_err(|error| ApiError(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let mut response = Json(json!({ "authenticated": true })).into_response();
+    response.headers_mut().insert(header::SET_COOKIE, cookie);
+    Ok(response)
+}
+
+pub async fn logout(
+    State(state): State<Arc<AppState>>,
+    request: Request<Body>,
+) -> Result<Response, ApiError> {
+    if let (Some(auth), Some(token)) = (state.auth.as_ref(), session_cookie(&request)) {
+        auth.logout(token)?;
+    }
+    let mut response = Json(json!({ "authenticated": false })).into_response();
+    response.headers_mut().insert(
+        header::SET_COOKIE,
+        HeaderValue::from_static("gos_session=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict"),
+    );
+    Ok(response)
+}
+
+fn session_cookie(request: &Request<Body>) -> Option<&str> {
+    request
+        .headers()
+        .get(header::COOKIE)?
+        .to_str()
+        .ok()?
+        .split(';')
+        .map(str::trim)
+        .find_map(|value| value.strip_prefix("gos_session="))
 }
 
 pub async fn status(State(state): State<Arc<AppState>>) -> Result<Json<StatusResponse>, ApiError> {

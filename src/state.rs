@@ -1,8 +1,13 @@
-use crate::{config::Config, db::Database, gemini_client::GeminiClient, secret::SecretCipher};
+use crate::{
+    auth::AuthManager, config::Config, db::Database, gemini_client::GeminiClient,
+    secret::SecretCipher,
+};
+use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc};
 
 pub struct AppState {
     pub config: Config,
+    pub auth: Option<Arc<AuthManager>>,
     pub db: Database,
     pub cipher: SecretCipher,
     pub gemini: GeminiClient,

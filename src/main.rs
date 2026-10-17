@@ -1,3 +1,4 @@
+mod auth;
 mod config;
 mod db;
 mod gedcom;
@@ -11,7 +12,9 @@ mod vision_filter;
 mod web;
 
 use anyhow::{Context, Result};
+use auth::AuthManager;
 use axum::{
+    middleware,
     routing::{get, post},
     Router,
 };
@@ -76,7 +79,10 @@ async fn main() -> Result<()> {
     }
 }
 
-fn build_state(config: Config) -> Result<(Arc<AppState>, mpsc::Receiver<()>)> {
+fn build_state(
+    config: Config,
+    auth: Option<Arc<AuthManager>>,
+) -> Result<(Arc<AppState>, mpsc::Receiver<()>)> {
     let db = Database::open(&config.database_path)?;
     let cipher = SecretCipher::load(&config.database_path)?;
     let gemini = GeminiClient::new(config.gemini_model.clone(), config.validation_model.clone())?;
@@ -85,6 +91,7 @@ fn build_state(config: Config) -> Result<(Arc<AppState>, mpsc::Receiver<()>)> {
     Ok((
         Arc::new(AppState {
             config,
+            auth,
             db,
             cipher,
             gemini,
@@ -98,7 +105,8 @@ fn build_state(config: Config) -> Result<(Arc<AppState>, mpsc::Receiver<()>)> {
 async fn serve() -> Result<()> {
     let config = Config::from_env();
     let bind_addr = config.bind_addr.clone();
-    let (state, receiver) = build_state(config)?;
+    let auth = Arc::new(AuthManager::from_env()?);
+    let (state, receiver) = build_state(config, Some(auth))?;
     let resume = state.db.job_status()?.running;
     queue::spawn_worker(Arc::clone(&state), receiver);
     if resume {
@@ -109,6 +117,9 @@ async fn serve() -> Result<()> {
             .context("resuming persisted scan job")?;
     }
     let app = Router::new()
+        .route("/login", get(web::views::login))
+        .route("/api/login", post(web::handlers::login))
+        .route("/api/logout", post(web::handlers::logout))
         .route("/", get(web::views::dashboard))
         .route("/settings", get(web::views::settings))
         .route("/audit", get(web::views::audit))
@@ -125,6 +136,10 @@ async fn serve() -> Result<()> {
         .route("/api/audit", post(web::handlers::run_audit))
         .route("/api/story/:xref", post(web::handlers::generate_story))
         .layer(RequestBodyLimitLayer::new(25 * 1024 * 1024))
+        .layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            web::handlers::require_login,
+        ))
         .layer(TraceLayer::new_for_http())
         .with_state(state);
     let listener = tokio::net::TcpListener::bind(&bind_addr)
@@ -176,7 +191,7 @@ fn cli_scan(directory: &std::path::Path, database: &std::path::Path) -> Result<(
 }
 
 async fn cli_process(file: &std::path::Path) -> Result<()> {
-    let (state, _receiver) = build_state(Config::from_env())?;
+    let (state, _receiver) = build_state(Config::from_env(), None)?;
     let transcript = queue::direct_process(&state, file).await?;
     println!("{transcript}");
     Ok(())

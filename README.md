@@ -9,11 +9,14 @@ cited biographies.
 Install Rust, then run:
 
 ```powershell
+$env:GOS_USERNAME = "researcher"
+$env:GOS_PASSWORD = "replace-this-with-a-long-random-password"
 cargo run -- serve
 ```
 
-The web interface listens at `http://127.0.0.1:3000` by default. Configure an
-API key in Settings or set `GEMINI_API_KEY`.
+The web interface listens at `http://127.0.0.1:3000` by default and requires
+the configured username and password. Use a unique password of at least 16
+characters. Configure an API key in Settings or set `GEMINI_API_KEY`.
 The default indexed folder is `/data/records`; set `RECORDS_DIR` to a local
 folder on Windows.
 
@@ -33,17 +36,34 @@ The scanner and deterministic GEDCOM checks run without network access.
 Edit `docker-compose.yml` to set the host research directory, then:
 
 ```powershell
+Copy-Item .env.example .env
+# Edit .env and set GOS_USERNAME and a unique GOS_PASSWORD (at least 16 chars).
 docker compose up --build
 ```
+
+The compose port is localhost-only by default. To access the UI from another
+device on a trusted home LAN, set `HOST_BIND_IP` in `.env` to this PC's LAN
+IPv4 address (for example `192.168.0.3`), then start or recreate the service:
+
+```dotenv
+HOST_BIND_IP=192.168.0.3
+GOS_USERNAME=researcher
+GOS_PASSWORD=use-a-unique-random-password-of-32-chars-or-more
+```
+
+Open `http://192.168.0.3:3000` from the other device and sign in. Allow inbound
+TCP port 3000 on the Windows firewall only for the private network profile if
+Windows blocks access. Keep this service on a trusted LAN: HTTP does not encrypt
+the password or session cookie in transit. Do not port-forward it or expose it
+to the public internet; use a TLS-terminating reverse proxy for access beyond
+the trusted LAN. Keep `.env` private; it contains the login credentials.
 
 The compose file mounts the host research folder at `/data/records` and
 generated stories at `/data/output`. Database/settings are stored in a Docker
 named volume mounted at `/app/data`, avoiding host bind-mount ownership errors.
 That volume persists across `docker compose down`; do not use `docker compose
 down -v` unless you intend to delete the database and encryption key.
-Browse to `http://localhost:3000`.
-The compose port is bound to localhost so the unauthenticated local UI is not
-published to other network interfaces.
+Browse to `http://localhost:3000` when using the default localhost-only binding.
 On Linux, set `PUID` and `PGID` to the owner IDs of the mounted research/output
 directories before building. Defaults are `1000:1000`:
 

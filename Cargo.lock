@@ -903,6 +903,7 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "sha2",
+ "subtle",
  "tempfile",
  "tokio",
  "tower-http 0.5.2",

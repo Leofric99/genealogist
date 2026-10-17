@@ -7,12 +7,14 @@ services:
         APP_GID: ${PGID:-1000}
     container_name: genealogy-ocr-studio
     ports:
-      - "127.0.0.1:3000:3000"
+      - "${HOST_BIND_IP:-127.0.0.1}:3000:3000"
     environment:
       DATABASE_PATH: /app/data/genealogy.sqlite3
       RECORDS_DIR: /data/records
       OUTPUT_DIR: /data/output
       BIND_ADDR: 0.0.0.0:3000
+      GOS_USERNAME: ${GOS_USERNAME:?Set GOS_USERNAME in .env}
+      GOS_PASSWORD: ${GOS_PASSWORD:?Set GOS_PASSWORD in .env to a password of at least 16 characters}
       # Optional; alternatively configure the key in the web Settings page.
       # GEMINI_API_KEY: ${GEMINI_API_KEY:-}
     volumes:

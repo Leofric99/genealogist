@@ -1,0 +1,40 @@
+<section class="card" x-data="loginPage()">
+  <h1>Sign in</h1>
+  <p>Sign in to access this genealogy research workspace.</p>
+  <form @submit.prevent="submit()">
+    <label>Username
+      <input type="text" autocomplete="username" x-model="username" required autofocus>
+    </label>
+    <label>Password
+      <input type="password" autocomplete="current-password" x-model="password" required>
+    </label>
+    <button type="submit" :disabled="busy">Sign in</button>
+    <p class="error" x-show="error" x-text="error"></p>
+  </form>
+</section>
+<script>
+function loginPage() {
+  return {
+    username: "", password: "", busy: false, error: "",
+    async submit() {
+      this.busy = true;
+      this.error = "";
+      try {
+        const response = await fetch("/api/login", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ username: this.username, password: this.password })
+        });
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.error || "Sign-in failed");
+        this.password = "";
+        window.location.replace("/");
+      } catch (error) {
+        this.error = error.message;
+      } finally {
+        this.busy = false;
+      }
+    }
+  };
+}
+</script>
