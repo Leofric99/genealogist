@@ -90,6 +90,44 @@ directories before building. Defaults are `1000:1000`:
 PUID=$(id -u) PGID=$(id -g) docker compose up --build
 ```
 
+## Suggested workflow
+
+1. **Prepare a working copy of your records.** Put supported scans in the
+   mounted research directory, organized however you prefer. GeneSleuth scans
+   recursively and ignores dot-prefixed files and directories. Keep your
+   originals backed up; the app writes transcripts beside records or in the
+   configured sidecar subfolders.
+2. **Configure the app before the first scan.** Sign in, open **Settings**, add
+   and test your Gemini API key, choose the transcription prompt, and select
+   where transcripts should be stored. In subfolder mode, choose a simple
+   folder name; that folder is created inside each source document's directory.
+   Changing this choice later does not move existing transcripts and may cause
+   files to be transcribed again at the new location.
+3. **Scan the records.** From the Dashboard, select **Scan records directory**
+   and monitor the saved progress. You can leave the page and reconnect later;
+   completed transcripts remain on disk. Use **Stop scan** to cancel remaining
+   work. Images may be filtered as non-documents; PDFs are processed directly,
+   with long PDFs split into pages and consolidated afterward.
+4. **Review the transcripts.** Open the generated Markdown files and correct
+   uncertain names, dates, relationships, or table alignment against the scans.
+   Keep the YAML frontmatter intact where possible because audits and source
+   matching use it. Manual transcript edits are preserved for unchanged source
+   files.
+5. **Upload your GEDCOM and audit the evidence.** On **GEDCOM audit**, upload
+   your `.ged` file, then run the audit. Review timeline, identity, and
+   location findings as leads rather than proven errors; the report is saved
+   under the configured output directory.
+6. **Generate individual Life Stories.** Enter a person's GEDCOM ID (for
+   example, `@I12@`) and choose a central stories folder or a person-specific
+   subfolder. Review the selected transcript sources, their matching clues,
+   confidence scores, and citations. Verify each claim against the original
+   record before relying on or sharing a biography.
+7. **Repeat as your research grows.** Add new scans and start another directory
+   scan; unchanged, successfully handled files are skipped. Files that failed
+   remain marked as errors and are retried on a later scan. **Clear indexed
+   files** resets the database's file index but preserves transcripts, so it
+   does not by itself force existing records to be transcribed again.
+
 ## Notes
 
 - Image files are heuristically filtered, then checked by Gemini Flash-Lite;
