@@ -187,7 +187,7 @@ pub fn relocate_existing_sidecars(
         }
     }
 
-    let mut completed = Vec::new();
+    let mut completed: Vec<(PathBuf, PathBuf)> = Vec::new();
     for (source, destination) in moves {
         if source == destination {
             continue;
