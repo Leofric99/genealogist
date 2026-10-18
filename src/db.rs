@@ -1,5 +1,6 @@
 use crate::config::{
     DEFAULT_SYSTEM_PROMPT, LEGACY_DEFAULT_SYSTEM_PROMPT, PREVIOUS_DEFAULT_SYSTEM_PROMPT,
+    PRIOR_DEFAULT_SYSTEM_PROMPT,
 };
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
@@ -66,11 +67,12 @@ impl Database {
              INSERT OR IGNORE INTO job (id) VALUES (1);",
         )?;
         connection.execute(
-            "UPDATE settings SET value = ?1 WHERE key = 'system_prompt' AND value IN (?2, ?3)",
+            "UPDATE settings SET value = ?1 WHERE key = 'system_prompt' AND value IN (?2, ?3, ?4)",
             params![
                 DEFAULT_SYSTEM_PROMPT,
                 LEGACY_DEFAULT_SYSTEM_PROMPT,
-                PREVIOUS_DEFAULT_SYSTEM_PROMPT
+                PREVIOUS_DEFAULT_SYSTEM_PROMPT,
+                PRIOR_DEFAULT_SYSTEM_PROMPT
             ],
         )?;
         Ok(Self {
@@ -280,6 +282,7 @@ impl Database {
 mod tests {
     use crate::config::{
         DEFAULT_SYSTEM_PROMPT, LEGACY_DEFAULT_SYSTEM_PROMPT, PREVIOUS_DEFAULT_SYSTEM_PROMPT,
+        PRIOR_DEFAULT_SYSTEM_PROMPT,
     };
 
     use super::Database;
@@ -320,6 +323,23 @@ mod tests {
                     .setting("system_prompt")
                     .expect("read custom prompt"),
                 Some("custom prompt".to_owned())
+            );
+        }
+
+        #[test]
+        fn opening_database_migrates_previous_census_prompt_but_preserves_custom_prompt() {
+            let directory = tempfile::tempdir().expect("temporary database directory");
+            let path = directory.path().join("genealogy.sqlite3");
+            let database = Database::open(&path).expect("open database");
+            database
+                .set_setting("system_prompt", PRIOR_DEFAULT_SYSTEM_PROMPT)
+                .expect("save previous prompt");
+            drop(database);
+
+            let database = Database::open(&path).expect("reopen database");
+            assert_eq!(
+                database.setting("system_prompt").expect("read prompt"),
+                Some(DEFAULT_SYSTEM_PROMPT.to_owned())
             );
         }
         let database = Database::open(&path).expect("reopen database");

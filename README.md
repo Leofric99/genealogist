@@ -153,9 +153,11 @@ PUID=$(id -u) PGID=$(id -g) docker compose up --build
 - The default transcription prompt preserves table columns, row alignment,
   empty cells, and source order without assuming a particular document type.
   It explicitly separates multi-level column headings and printed form
-  instructions from table data, and asks for one row per person on census-style
-  schedules. Existing exact copies of previous built-in prompts are upgraded
-  on startup; custom prompts are left unchanged.
+  instructions from table data, asks for one row per person on census-style
+  schedules, handles ditto surnames and side-by-side index blocks, and excludes
+  website controls from digitized record screenshots. Existing exact copies of
+  previous built-in prompts are upgraded on startup; custom prompts are left
+  unchanged.
 - API keys are encrypted in SQLite using a local encryption key. Back up the
   `.encryption-key` file along with the database; alternatively supply a stable
   64-hex-character `GOS_MASTER_KEY`.

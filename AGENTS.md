@@ -19,6 +19,8 @@
 - Keep the default transcription prompt format-agnostic. Its table guidance
   should preserve source row/column relationships, require consistent cell
   counts, and use compact Markdown separators rather than content-width padding.
+  Keep headings/instructions separate from table values; handle ditto surname
+  continuation and side-by-side index blocks explicitly without over-inference.
 - When changing the built-in prompt, migrate only an exact match of the prior
   built-in text so saved custom prompts remain untouched.
 - Life story source matching lives in `src/web/story_sources.rs`; keep fuzzy
