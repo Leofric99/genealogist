@@ -1,6 +1,6 @@
 use crate::config::{
-    DEFAULT_SYSTEM_PROMPT, LEGACY_DEFAULT_SYSTEM_PROMPT, PREVIOUS_DEFAULT_SYSTEM_PROMPT,
-    PRIOR_DEFAULT_SYSTEM_PROMPT,
+    DEFAULT_SYSTEM_PROMPT, LAST_DEFAULT_SYSTEM_PROMPT, LEGACY_DEFAULT_SYSTEM_PROMPT,
+    PREVIOUS_DEFAULT_SYSTEM_PROMPT, PRIOR_DEFAULT_SYSTEM_PROMPT,
 };
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
@@ -67,12 +67,13 @@ impl Database {
              INSERT OR IGNORE INTO job (id) VALUES (1);",
         )?;
         connection.execute(
-            "UPDATE settings SET value = ?1 WHERE key = 'system_prompt' AND value IN (?2, ?3, ?4)",
+            "UPDATE settings SET value = ?1 WHERE key = 'system_prompt' AND value IN (?2, ?3, ?4, ?5)",
             params![
                 DEFAULT_SYSTEM_PROMPT,
                 LEGACY_DEFAULT_SYSTEM_PROMPT,
                 PREVIOUS_DEFAULT_SYSTEM_PROMPT,
-                PRIOR_DEFAULT_SYSTEM_PROMPT
+                PRIOR_DEFAULT_SYSTEM_PROMPT,
+                LAST_DEFAULT_SYSTEM_PROMPT
             ],
         )?;
         Ok(Self {
@@ -281,8 +282,8 @@ impl Database {
 #[cfg(test)]
 mod tests {
     use crate::config::{
-        DEFAULT_SYSTEM_PROMPT, LEGACY_DEFAULT_SYSTEM_PROMPT, PREVIOUS_DEFAULT_SYSTEM_PROMPT,
-        PRIOR_DEFAULT_SYSTEM_PROMPT,
+        DEFAULT_SYSTEM_PROMPT, LAST_DEFAULT_SYSTEM_PROMPT, LEGACY_DEFAULT_SYSTEM_PROMPT,
+        PREVIOUS_DEFAULT_SYSTEM_PROMPT, PRIOR_DEFAULT_SYSTEM_PROMPT,
     };
 
     use super::Database;
@@ -298,50 +299,6 @@ mod tests {
                 .expect("save previous default prompt");
         }
 
-        #[test]
-        fn opening_database_migrates_previous_table_prompt_but_preserves_custom_prompt() {
-            let directory = tempfile::tempdir().expect("temporary database directory");
-            let path = directory.path().join("genealogy.sqlite3");
-            let database = Database::open(&path).expect("open database");
-            database
-                .set_setting("system_prompt", PREVIOUS_DEFAULT_SYSTEM_PROMPT)
-                .expect("save previous table prompt");
-            drop(database);
-
-            let database = Database::open(&path).expect("reopen database");
-            assert_eq!(
-                database.setting("system_prompt").expect("read prompt"),
-                Some(DEFAULT_SYSTEM_PROMPT.to_owned())
-            );
-            database
-                .set_setting("system_prompt", "custom prompt")
-                .expect("save custom prompt");
-            drop(database);
-            let database = Database::open(&path).expect("reopen with custom prompt");
-            assert_eq!(
-                database
-                    .setting("system_prompt")
-                    .expect("read custom prompt"),
-                Some("custom prompt".to_owned())
-            );
-        }
-
-        #[test]
-        fn opening_database_migrates_previous_census_prompt_but_preserves_custom_prompt() {
-            let directory = tempfile::tempdir().expect("temporary database directory");
-            let path = directory.path().join("genealogy.sqlite3");
-            let database = Database::open(&path).expect("open database");
-            database
-                .set_setting("system_prompt", PRIOR_DEFAULT_SYSTEM_PROMPT)
-                .expect("save previous prompt");
-            drop(database);
-
-            let database = Database::open(&path).expect("reopen database");
-            assert_eq!(
-                database.setting("system_prompt").expect("read prompt"),
-                Some(DEFAULT_SYSTEM_PROMPT.to_owned())
-            );
-        }
         let database = Database::open(&path).expect("reopen database");
         assert_eq!(
             database.setting("system_prompt").expect("read prompt"),
@@ -358,6 +315,68 @@ mod tests {
                 .setting("system_prompt")
                 .expect("read custom prompt"),
             Some("custom prompt".to_owned())
+        );
+    }
+
+    #[test]
+    fn opening_database_migrates_previous_table_prompt_but_preserves_custom_prompt() {
+        let directory = tempfile::tempdir().expect("temporary database directory");
+        let path = directory.path().join("genealogy.sqlite3");
+        let database = Database::open(&path).expect("open database");
+        database
+            .set_setting("system_prompt", PREVIOUS_DEFAULT_SYSTEM_PROMPT)
+            .expect("save previous table prompt");
+        drop(database);
+
+        let database = Database::open(&path).expect("reopen database");
+        assert_eq!(
+            database.setting("system_prompt").expect("read prompt"),
+            Some(DEFAULT_SYSTEM_PROMPT.to_owned())
+        );
+        database
+            .set_setting("system_prompt", "custom prompt")
+            .expect("save custom prompt");
+        drop(database);
+        let database = Database::open(&path).expect("reopen with custom prompt");
+        assert_eq!(
+            database
+                .setting("system_prompt")
+                .expect("read custom prompt"),
+            Some("custom prompt".to_owned())
+        );
+    }
+
+    #[test]
+    fn opening_database_migrates_previous_census_prompt_but_preserves_custom_prompt() {
+        let directory = tempfile::tempdir().expect("temporary database directory");
+        let path = directory.path().join("genealogy.sqlite3");
+        let database = Database::open(&path).expect("open database");
+        database
+            .set_setting("system_prompt", PRIOR_DEFAULT_SYSTEM_PROMPT)
+            .expect("save previous prompt");
+        drop(database);
+
+        let database = Database::open(&path).expect("reopen database");
+        assert_eq!(
+            database.setting("system_prompt").expect("read prompt"),
+            Some(DEFAULT_SYSTEM_PROMPT.to_owned())
+        );
+    }
+
+    #[test]
+    fn opening_database_migrates_last_default_prompt() {
+        let directory = tempfile::tempdir().expect("temporary database directory");
+        let path = directory.path().join("genealogy.sqlite3");
+        let database = Database::open(&path).expect("open database");
+        database
+            .set_setting("system_prompt", LAST_DEFAULT_SYSTEM_PROMPT)
+            .expect("save last prompt");
+        drop(database);
+
+        let database = Database::open(&path).expect("reopen database");
+        assert_eq!(
+            database.setting("system_prompt").expect("read prompt"),
+            Some(DEFAULT_SYSTEM_PROMPT.to_owned())
         );
     }
 
