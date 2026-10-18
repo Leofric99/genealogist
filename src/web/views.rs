@@ -1,7 +1,7 @@
 use axum::response::Html;
 
 const BASE: &str = include_str!("../../templates/base.html");
-const NAVIGATION: &str = r#"<a href="/">Dashboard</a><a href="/settings">Settings</a><a href="/audit">GEDCOM audit</a><button class="secondary" type="button" onclick="signOut()">Sign out</button>"#;
+const NAVIGATION: &str = r#"<a href="/">Dashboard</a><a href="/errors">Errors</a><a href="/settings">Settings</a><a href="/audit">GEDCOM audit</a><button class="secondary" type="button" onclick="signOut()">Sign out</button>"#;
 
 fn render(title: &str, body: &str, authenticated: bool) -> Html<String> {
     Html(
@@ -20,6 +20,10 @@ pub async fn dashboard() -> Html<String> {
         include_str!("../../templates/dashboard.html"),
         true,
     )
+}
+
+pub async fn errors() -> Html<String> {
+    render("Errors", include_str!("../../templates/errors.html"), true)
 }
 
 pub async fn login() -> Html<String> {

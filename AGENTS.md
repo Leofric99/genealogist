@@ -22,16 +22,24 @@
   never move source documents, and refuse collisions rather than overwrite.
   Do not overwrite a transcript for an unchanged file when it already exists
   at the configured path. Legacy JSON/YAML sidecars are ignored and left
-  untouched.
+  untouched. Clearing the indexed-file table is the explicit exception: mark
+  the database for re-transcription, then replace existing transcripts as
+  successful outputs are produced on the next web scan. Keep that marker across
+  stopped or interrupted scans and clear it only after a complete scan.
 - Keep the default transcription prompt format-agnostic. Its table guidance
   should preserve source row/column relationships, require consistent cell
   counts, and use compact Markdown separators rather than content-width padding.
+  Require a completeness inventory of every page and visible region, followed
+  by transcription of all tables, lists, and page-layout columns, including
+  multiple independent structures on one page and center/right-side blocks.
+  The prompt must not assume a fixed number of pages, columns, or tables.
   Keep headings/instructions separate from table values; preserve ditto marks
   literally in Markdown. Keep side-by-side index blocks explicitly separated.
   `src/gemini_client.rs` appends a mandatory whole-image layout rule to prompts
-  for all MIME types: open-book pages, partial neighboring-page strips, and
-  columns stay separate, and processing must cover the full image without
-  cropping. Keep that rule format-agnostic and preserve it for custom prompts.
+  for all MIME types: every page and page-layout column block must be accounted
+  for, open-book pages and partial neighboring-page strips stay separate, and
+  processing covers the full image without cropping. Preserve the rule for
+  custom prompts and carry the completeness requirement into PDF consolidation.
 - When changing the built-in prompt, migrate only an exact match of the prior
   built-in text so saved custom prompts remain untouched.
 - Life Story discovery lives in `src/web/story_sources.rs`; match source
@@ -58,7 +66,9 @@
   persisting the database.
 - Queue progress is broadcast to WebSocket clients and can be recovered from
   SQLite after a server restart. Keep the WebSocket status event consistent
-  with the dashboard.
+  with the dashboard. The Errors view lists only rows with `error` status and
+  retries one selected file through the normal processing path while using the
+  shared job status to prevent overlap with a directory scan.
 - Hidden dot-prefixed files and directories are excluded from recursive scans.
   The clear-index operation removes only SQLite file rows and resets counters;
   it must preserve originals and sidecar transcripts.

@@ -113,6 +113,7 @@ PUID=$(id -u) PGID=$(id -g) docker compose up --build
    work. Images may be filtered as non-documents. PDFs are first sent to Gemini
    whole regardless of page count; only a size/input/output-token rejection
    triggers a retry as groups of ten pages followed by consolidation.
+   Open **Errors** to review failed files and retry them individually.
 4. **Review the transcripts.** Open the generated Markdown files and correct
    uncertain names, dates, relationships, or table alignment against the scans.
    The `.md` file is the complete transcription and the only new per-document
@@ -134,8 +135,11 @@ PUID=$(id -u) PGID=$(id -g) docker compose up --build
 7. **Repeat as your research grows.** Add new scans and start another directory
    scan; unchanged, successfully handled files are skipped. Files that failed
    remain marked as errors and are retried on a later scan. **Clear indexed
-   files** resets the database's file index but preserves transcripts, so it
-   does not by itself force existing records to be transcribed again.
+   files** resets the database's file index and preserves source documents.
+   The next web scan re-transcribes the indexed records and replaces each
+   existing Markdown transcript only after a replacement is generated
+   successfully. A stopped scan leaves the remaining records marked for
+   re-transcription on the next web scan.
 
 ## Notes
 
@@ -169,17 +173,18 @@ PUID=$(id -u) PGID=$(id -g) docker compose up --build
 - The default transcription prompt produces body-only Markdown and preserves
   table columns, row alignment,
   empty cells, and source order without assuming a particular document type.
-  It explicitly separates multi-level column headings and printed form
-  instructions from table data, asks for one row per person on census-style
-  schedules, preserves ditto marks exactly, and excludes website controls from
-  digitized record screenshots. A mandatory image-only safeguard instructs
-  Gemini to return a structured non-document marker for clear photographs and
-  artwork; those images are saved as `filtered` without Markdown or later
-  retries unless their source changes. Existing exact copies of previous
-  built-in prompts are upgraded on startup; custom prompt text is left
-  unchanged. At request time, a whole-image layout rule is appended to both
-  built-in and custom prompts so open-book spreads, partial adjacent pages, and
-  independent columns are transcribed separately without cropping the source.
+  It asks Gemini to inventory each page and every visible region before
+  transcribing, then verify that every table, list, and page-layout column
+  block—including center and far-right blocks and multiple tables on a page—is
+  included. It also separates multi-level column headings and printed form
+  instructions from table data, preserves ditto marks exactly, and excludes
+  website controls from digitized record screenshots. A mandatory image-only
+  safeguard instructs Gemini to return a structured non-document marker for
+  clear photographs and artwork; those images are saved as `filtered` without
+  Markdown or later retries unless their source changes. Existing exact copies
+  of previous built-in prompts are upgraded on startup; custom prompt text is
+  left unchanged. At request time, a whole-image completeness/layout rule is
+  appended to built-in and custom prompts and to PDF consolidation requests.
 - Life Story discovery searches transcript bodies and paths using the GEDCOM
   person's name, dates, places, and related people. Candidate matches are
   stored in SQLite as suggested, confirmed, or rejected links, keyed by the

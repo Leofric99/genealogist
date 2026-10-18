@@ -50,6 +50,7 @@ pub async fn run_scan(state: Arc<AppState>) -> Result<()> {
     let Some(files) = files else {
         return finish_stopped_scan(&state).await;
     };
+    let has_files = !files.is_empty();
     state.db.update_job(Some(files.len()), 0, 0, None, None)?;
     publish_status(&state).await;
 
@@ -110,6 +111,9 @@ pub async fn run_scan(state: Arc<AppState>) -> Result<()> {
     if cancellation.is_cancelled() {
         return finish_stopped_scan(&state).await;
     }
+    if has_files {
+        state.db.finish_index_clear_retranscription()?;
+    }
     state.db.finish_job(Some("Scan complete"))?;
     publish_status(&state).await;
     Ok(())
@@ -138,6 +142,7 @@ async fn process_one(
     let previous_hash = state.db.file_hash(&source)?;
     let previous_status = state.db.file_status(&source)?;
     let previous_error = state.db.file_error(&source)?;
+    let force_retranscription = state.db.index_clear_retranscription_pending()?;
     let transcript_path = sidecars.transcript_path(path);
     let transcript_path_string = transcript_path.to_string_lossy().into_owned();
     let previous_transcript_path = state.db.file_transcript_path(&source)?;
@@ -151,7 +156,9 @@ async fn process_one(
         && previous_transcript_path.as_deref() == Some(transcript_path_string.as_str())
         && transcript_path.is_file();
 
-    if transcript_is_current {
+    if transcript_is_current
+        && (!force_retranscription || previous_status.as_deref() == Some("transcribed"))
+    {
         if previous_error.is_some() || previous_status.as_deref() == Some("metadata_error") {
             state.db.save_file(
                 &source,
@@ -180,7 +187,8 @@ async fn process_one(
     }
 
     let is_pdf = file.extension == "pdf";
-    if transcript_path.is_file()
+    if !force_retranscription
+        && transcript_path.is_file()
         && previous_hash
             .as_deref()
             .map_or(true, |hash| hash == file.sha256)
@@ -467,12 +475,66 @@ pub async fn direct_process(state: &AppState, path: &Path) -> Result<String> {
             score.horizontal_line_rows
         )
     }).unwrap_or_default();
-    let result = match process_one(state, &one, &sidecars, image_score, None).await? {
-        ProcessResult::Processed => {
+    let source = one.path.to_string_lossy().into_owned();
+    let process_result = process_one(state, &one, &sidecars, image_score, None).await;
+    let result = match process_result {
+        Ok(ProcessResult::Processed) => {
             let transcript = sidecars.transcript_path(path);
             format!("Transcript: {}", transcript.display())
         }
-        ProcessResult::Skipped(reason) => format!("Skipped: {reason}"),
+        Ok(ProcessResult::Skipped(reason)) => format!("Skipped: {reason}"),
+        Err(error) => {
+            let details = format!("{error:#}");
+            state
+                .db
+                .save_file(&source, &one.sha256, "error", None, Some(&details))?;
+            return Err(error);
+        }
     };
     Ok(format!("{score_summary}{result}"))
+}
+
+pub async fn retry_error_file(state: &AppState, path: &Path) -> Result<String> {
+    let source = path.to_string_lossy().into_owned();
+    let cancellation = CancellationToken::new();
+    *state
+        .scan_cancellation
+        .lock()
+        .map_err(|_| anyhow::anyhow!("scan cancellation lock poisoned"))? = cancellation.clone();
+    let active = format!("Retrying {}", path.display());
+    state
+        .db
+        .update_job(Some(1), 0, 0, Some(&active), Some("Retrying failed file"))?;
+    publish_status(state).await;
+
+    let result = tokio::select! {
+        _ = cancellation.cancelled() => Err(anyhow::anyhow!("Retry cancelled by user")),
+        result = direct_process(state, path) => result,
+    };
+    if let Err(error) = &result {
+        if state.db.file_status(&source)?.as_deref() == Some("error") {
+            let details = format!("{error:#}");
+            if let Some(hash) = state.db.file_hash(&source)? {
+                state
+                    .db
+                    .save_file(&source, &hash, "error", None, Some(&details))?;
+            }
+        }
+    }
+    let (skipped, message) = match &result {
+        Ok(message) => (
+            if message.starts_with("Skipped:") {
+                1
+            } else {
+                0
+            },
+            Some(message.clone()),
+        ),
+        Err(error) => (0, Some(format!("Retry failed: {error:#}"))),
+    };
+    state
+        .db
+        .update_job(None, 1, skipped, None, message.as_deref())?;
+    publish_status(state).await;
+    result
 }

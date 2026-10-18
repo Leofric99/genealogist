@@ -18,6 +18,9 @@ const PRE_DITTO_PROMPT_SHA256: &str =
     "729d982d4e4490322125dcdddc588c36f3d1d5ebd8025c36d66608dbc689993e";
 const PRE_TRANSCRIPT_ONLY_PROMPT_SHA256: &str =
     "486ec5bab3a73546704cb88fe3f0072bd00d2109b89085ad2af5171f239a898a";
+const PRE_MULTI_COLUMN_COMPLETENESS_PROMPT_SHA256: &str =
+    "6f21d929751f8a56e21c9467228f8b096c4b7b03b359ac5faf3b8e0702b1125d";
+const CLEAR_INDEX_RETRANSCRIBE_SETTING: &str = "retranscribe_existing_after_index_clear";
 
 pub struct Database {
     connection: Mutex<Connection>,
@@ -152,6 +155,7 @@ impl Database {
                 PRE_METADATA_PROMPT_SHA256,
                 PRE_DITTO_PROMPT_SHA256,
                 PRE_TRANSCRIPT_ONLY_PROMPT_SHA256,
+                PRE_MULTI_COLUMN_COMPLETENESS_PROMPT_SHA256,
             ]
             .contains(&fingerprint.as_str())
         }) {
@@ -185,6 +189,18 @@ impl Database {
             "INSERT INTO settings (key, value) VALUES (?1, ?2)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             params![key, value],
+        )?;
+        Ok(())
+    }
+
+    pub fn index_clear_retranscription_pending(&self) -> Result<bool> {
+        Ok(self.setting(CLEAR_INDEX_RETRANSCRIBE_SETTING)?.as_deref() == Some("true"))
+    }
+
+    pub fn finish_index_clear_retranscription(&self) -> Result<()> {
+        self.connection()?.execute(
+            "DELETE FROM settings WHERE key = ?1",
+            [CLEAR_INDEX_RETRANSCRIBE_SETTING],
         )?;
         Ok(())
     }
@@ -533,6 +549,20 @@ impl Database {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
+    pub fn error_file_statuses(&self) -> Result<Vec<FileStatus>> {
+        let conn = self.connection()?;
+        let mut stmt =
+            conn.prepare("SELECT path,status,error FROM files WHERE status='error' ORDER BY updated_at DESC,path")?;
+        let rows = stmt.query_map([], |row| {
+            Ok(FileStatus {
+                path: row.get(0)?,
+                status: row.get(1)?,
+                error: row.get(2)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
     pub fn clear_file_index(&self) -> Result<bool> {
         let mut connection = self.connection()?;
         let transaction = connection.transaction()?;
@@ -543,8 +573,13 @@ impl Database {
         }
         transaction.execute("DELETE FROM files", [])?;
         transaction.execute(
+            "INSERT INTO settings (key, value) VALUES (?1, 'true')
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            [CLEAR_INDEX_RETRANSCRIBE_SETTING],
+        )?;
+        transaction.execute(
             "UPDATE job SET total=0, processed=0, skipped=0, active=NULL,
-             message='Indexed files cleared; transcripts were preserved' WHERE id=1",
+             message='Index cleared; the next web scan will re-transcribe and overwrite existing transcripts' WHERE id=1",
             [],
         )?;
         transaction.commit()?;
@@ -808,6 +843,9 @@ mod tests {
         database.finish_job(Some("complete")).expect("finish job");
         assert!(database.clear_file_index().expect("clear index"));
         assert!(database
+            .index_clear_retranscription_pending()
+            .expect("check pending re-transcription"));
+        assert!(database
             .file_statuses()
             .expect("read cleared files")
             .is_empty());
@@ -819,9 +857,45 @@ mod tests {
             std::fs::read_to_string(transcript).expect("read transcript"),
             "existing transcript"
         );
+        database
+            .finish_index_clear_retranscription()
+            .expect("finish index-clear re-transcription");
+        assert!(!database
+            .index_clear_retranscription_pending()
+            .expect("check completed re-transcription"));
         let status = database.job_status().expect("read job status");
         assert_eq!(status.total, 0);
         assert_eq!(status.processed, 0);
         assert_eq!(status.skipped, 0);
+    }
+
+    #[test]
+    fn error_file_statuses_returns_only_failed_files_with_details() {
+        let directory = tempfile::tempdir().expect("temporary database directory");
+        let database =
+            Database::open(&directory.path().join("genealogy.sqlite3")).expect("open database");
+        database
+            .save_file(
+                "records/failed.jpg",
+                "abc123",
+                "error",
+                None,
+                Some("bad image"),
+            )
+            .expect("save failed file");
+        database
+            .save_file(
+                "records/done.jpg",
+                "def456",
+                "transcribed",
+                Some("records/done.md"),
+                None,
+            )
+            .expect("save successful file");
+
+        let errors = database.error_file_statuses().expect("read error files");
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].path, "records/failed.jpg");
+        assert_eq!(errors[0].error.as_deref(), Some("bad image"));
     }
 }

@@ -1,0 +1,93 @@
+<section x-data="errorsPage()" x-init="init()">
+  <h1>Scanning errors</h1>
+  <p>Files that could not be processed appear here with their latest error. Retry them individually after fixing any underlying issue. A retry may take a while while Gemini processes the file.</p>
+  <div class="card">
+    <div class="row">
+      <button type="button" class="secondary" @click="load()" :disabled="loading || retryingPath">Refresh errors</button>
+      <span class="muted" x-text="`${files.length} file(s) with errors`"></span>
+    </div>
+    <p class="notice" x-show="message" x-text="message"></p>
+    <p class="muted" x-show="loading && files.length === 0">Loading errors…</p>
+    <p class="muted" x-show="!loading && !loadError && files.length === 0">No scanning errors are currently recorded.</p>
+    <div x-show="files.length > 0" style="overflow-x:auto">
+      <table>
+        <thead><tr><th>File</th><th>Error</th><th>Action</th></tr></thead>
+        <tbody>
+          <template x-for="file in files" :key="file.path">
+            <tr>
+              <td><code x-text="file.path"></code></td>
+              <td class="error" x-text="file.error || 'No error details recorded'"></td>
+              <td>
+                <button type="button" @click="retry(file)" :disabled="retryingPath || loading">
+                  <span x-text="retryingPath === file.path ? 'Retrying…' : 'Retry'"></span>
+                </button>
+              </td>
+            </tr>
+          </template>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</section>
+<script>
+function errorsPage() {
+  return {
+    files: [],
+    loading: false,
+    loadError: false,
+    retryingPath: "",
+    message: "",
+    init() {
+      this.load();
+      setInterval(() => {
+        if (!this.loading && !this.retryingPath) this.load();
+      }, 5000);
+    },
+    async load() {
+      this.loading = true;
+      this.loadError = false;
+      try {
+        const response = await fetch("/api/errors");
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || "Unable to load scanning errors");
+        this.files = data.files;
+      } catch (error) {
+        this.loadError = true;
+        this.message = error.message;
+      } finally {
+        this.loading = false;
+      }
+    },
+    async retry(file) {
+      if (this.retryingPath || this.loading) return;
+      this.retryingPath = file.path;
+      this.message = `Retrying ${file.path}…`;
+      try {
+        const response = await fetch("/api/errors", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ path: file.path })
+        });
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || "Retry failed");
+        this.message = data.message;
+        await this.waitForRetry();
+      } catch (error) {
+        this.message = error.message;
+      } finally {
+        this.retryingPath = "";
+        await this.load();
+      }
+    },
+    async waitForRetry() {
+      while (this.retryingPath) {
+        await new Promise(resolve => setTimeout(resolve, 1200));
+        const response = await fetch("/api/status");
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || "Unable to read retry progress");
+        if (!data.job.running) break;
+      }
+    }
+  };
+}
+</script>

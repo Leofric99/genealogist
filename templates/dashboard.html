@@ -17,7 +17,7 @@
   </div>
   <div class="card">
     <h2>Indexed files</h2>
-    <p class="muted">Files with unchanged checksums and matching transcripts are skipped. Failed files remain visible for troubleshooting and are retried on the next scan.</p>
+    <p class="muted">Files with unchanged checksums and matching transcripts are skipped. Clearing the index makes the next scan regenerate existing transcripts and replace them when transcription succeeds. Failed files remain visible for troubleshooting and are retried on the next scan.</p>
     <div style="overflow-x:auto">
       <table>
         <thead><tr><th>File</th><th>Status</th><th>Details</th></tr></thead>
@@ -66,7 +66,7 @@ function dashboard() {
     },
     async clearIndex() {
       if (this.running) return;
-      if (!window.confirm("Clear the indexed file list? This preserves source files and sidecar transcripts; a later scan will recognize existing transcripts and skip them. Continue?")) return;
+      if (!window.confirm("Clear the indexed file list? Source documents will be preserved. The next web scan will re-transcribe documents and overwrite their existing Markdown transcripts as each replacement succeeds. Continue?")) return;
       try {
         const response = await fetch("/api/index/clear", { method: "POST" });
         const data = await response.json();

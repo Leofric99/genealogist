@@ -48,6 +48,11 @@ pub struct StatusResponse {
     pub files: Vec<FileStatus>,
 }
 
+#[derive(Deserialize)]
+pub struct RetryErrorFileRequest {
+    pub path: String,
+}
+
 #[derive(Serialize)]
 pub struct SettingsResponse {
     pub has_api_key: bool,
@@ -204,6 +209,64 @@ pub async fn status(State(state): State<Arc<AppState>>) -> Result<Json<StatusRes
     }))
 }
 
+pub async fn error_files(State(state): State<Arc<AppState>>) -> Result<Json<Value>, ApiError> {
+    Ok(Json(json!({
+        "files": state.db.error_file_statuses()?
+    })))
+}
+
+pub async fn retry_error_file(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<RetryErrorFileRequest>,
+) -> Result<Json<Value>, ApiError> {
+    if request.path.len() > 4096 {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            "File path exceeds 4,096 characters".to_owned(),
+        ));
+    }
+    if state.db.job_status()?.running {
+        return Err(ApiError(
+            StatusCode::CONFLICT,
+            "Wait for the current scan or retry to finish before retrying another file".to_owned(),
+        ));
+    }
+    if state.db.file_status(&request.path)?.as_deref() != Some("error") {
+        return Err(ApiError(
+            StatusCode::NOT_FOUND,
+            "This file is no longer marked as an error".to_owned(),
+        ));
+    }
+    if !state.db.begin_job()? {
+        return Err(ApiError(
+            StatusCode::CONFLICT,
+            "Another scan or retry started; try again when it finishes".to_owned(),
+        ));
+    }
+
+    let retry_state = Arc::clone(&state);
+    let path = PathBuf::from(request.path);
+    tokio::spawn(async move {
+        let result = queue::retry_error_file(&retry_state, &path).await;
+        let final_message = match result {
+            Ok(message) => format!("Retry complete: {message}"),
+            Err(error) => {
+                let message = format!("Retry failed: {error:#}");
+                tracing::error!(%message, "individual file retry failed");
+                message
+            }
+        };
+        if let Err(error) = retry_state.db.finish_job(Some(&final_message)) {
+            tracing::error!(%error, "failed to finish individual file retry");
+        }
+        queue::publish_status(&retry_state).await;
+    });
+    Ok(Json(json!({
+        "started": true,
+        "message": "Retry started. Progress is available on the Dashboard."
+    })))
+}
+
 pub async fn status_fragment(
     State(state): State<Arc<AppState>>,
 ) -> Result<axum::response::Html<String>, ApiError> {
@@ -254,7 +317,7 @@ pub async fn clear_index(State(state): State<Arc<AppState>>) -> Result<Json<Valu
     queue::publish_status(&state).await;
     Ok(Json(json!({
         "cleared": true,
-        "message": "Indexed files cleared. Source files and transcripts were preserved."
+        "message": "Index cleared. Source files are preserved; the next web scan will re-transcribe documents and replace existing transcripts as each replacement succeeds."
     })))
 }
 

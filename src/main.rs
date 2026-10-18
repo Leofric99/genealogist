@@ -131,11 +131,16 @@ async fn serve() -> Result<()> {
         .route("/api/login", post(web::handlers::login))
         .route("/api/logout", post(web::handlers::logout))
         .route("/", get(web::views::dashboard))
+        .route("/errors", get(web::views::errors))
         .route("/settings", get(web::views::settings))
         .route("/audit", get(web::views::audit))
         .route("/ws", get(web::websocket::handler))
         .route("/partials/status", get(web::handlers::status_fragment))
         .route("/api/status", get(web::handlers::status))
+        .route(
+            "/api/errors",
+            get(web::handlers::error_files).post(web::handlers::retry_error_file),
+        )
         .route("/api/scan", post(web::handlers::start_scan))
         .route("/api/scan/stop", post(web::handlers::stop_scan))
         .route("/api/index/clear", post(web::handlers::clear_index))
@@ -176,6 +181,7 @@ fn cli_scan(directory: &std::path::Path, database: &std::path::Path) -> Result<(
     let db = Database::open(database)?;
     let sidecars = SidecarConfig::load(&db)?;
     let exclusions = scanner::DirectoryExclusions::load(&db)?;
+    let force_retranscription = db.index_clear_retranscription_pending()?;
     let files = scanner::scan_and_hash_with_exclusions(directory, &exclusions)?;
     let mut new_or_modified = 0usize;
     let mut unchanged = 0usize;
@@ -202,7 +208,8 @@ fn cli_scan(directory: &std::path::Path, database: &std::path::Path) -> Result<(
         } else {
             if indexed_hash.as_deref() == Some(&file.sha256) && status.as_deref() == Some("error") {
                 new_or_modified += 1;
-            } else if transcript.is_file()
+            } else if !force_retranscription
+                && transcript.is_file()
                 && status.as_deref() != Some("error")
                 && stored_transcript.as_deref() != Some(transcript_string.as_ref())
             {
