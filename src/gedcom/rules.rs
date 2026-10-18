@@ -191,7 +191,9 @@ fn check_duplicate_identity(
         let text = fs::read_to_string(entry.path())?;
         let frontmatter: TranscriptFrontmatter =
             match crate::transcript_data::read_for_transcript(entry.path())? {
-                Some(metadata) => serde_yaml::from_value(metadata.to_legacy_metadata()?)?,
+                Some(metadata) => {
+                    serde_yaml::from_value(crate::transcript_data::to_legacy_metadata(&metadata)?)?
+                }
                 None => {
                     let Some(frontmatter) = extract_frontmatter(&text) else {
                         continue;

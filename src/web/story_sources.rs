@@ -40,7 +40,7 @@ pub fn collect_person_sources(records: &Path, person: &PersonIdentity) -> Result
             .to_string_lossy()
             .replace('\\', "/");
         let metadata = match crate::transcript_data::read_for_transcript(entry.path())? {
-            Some(metadata) => metadata.to_legacy_metadata()?,
+            Some(metadata) => crate::transcript_data::to_legacy_metadata(&metadata)?,
             None => {
                 let Some(frontmatter) = extract_frontmatter(&contents) else {
                     continue;
