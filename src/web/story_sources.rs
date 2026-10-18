@@ -209,7 +209,7 @@ fn matching_evidence(
         evidence.push(format!(
             "GEDCOM relative name(s) also appear: {}",
             related_names
-                .into_iter()
+                .iter()
                 .map(|name| name.as_str())
                 .collect::<Vec<_>>()
                 .join(", ")

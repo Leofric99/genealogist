@@ -2,7 +2,7 @@ use super::{
     graph::FamilyGraph,
     parser::{date_year, Gedcom},
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, fs, path::Path};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
