@@ -5,11 +5,15 @@ use crate::config::{
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use std::{
     path::Path,
     sync::Mutex,
     time::{SystemTime, UNIX_EPOCH},
 };
+
+const PRE_METADATA_PROMPT_SHA256: &str =
+    "798f051cfd905879abf27cd6df18c2baf817f25e6ef21c4616afe3b155132674";
 
 pub struct Database {
     connection: Mutex<Connection>,
@@ -76,6 +80,22 @@ impl Database {
                 LAST_DEFAULT_SYSTEM_PROMPT
             ],
         )?;
+        let stored_prompt: Option<String> = connection
+            .query_row(
+                "SELECT value FROM settings WHERE key = 'system_prompt'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        // Fingerprint of the immediately previous built-in prompt; custom text is not migrated.
+        if stored_prompt.as_deref().is_some_and(|prompt| {
+            hex::encode(Sha256::digest(prompt.as_bytes())) == PRE_METADATA_PROMPT_SHA256
+        }) {
+            connection.execute(
+                "UPDATE settings SET value = ?1 WHERE key = 'system_prompt'",
+                [DEFAULT_SYSTEM_PROMPT],
+            )?;
+        }
         Ok(Self {
             connection: Mutex::new(connection),
         })

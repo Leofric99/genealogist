@@ -34,17 +34,23 @@ pub fn collect_person_sources(records: &Path, person: &PersonIdentity) -> Result
             continue;
         }
         let contents = fs::read_to_string(entry.path())?;
-        let Some(frontmatter) = extract_frontmatter(&contents) else {
-            continue;
-        };
-        let Ok(metadata) = serde_yaml::from_str::<Value>(frontmatter) else {
-            continue;
-        };
         let relative_path = entry
             .path()
             .strip_prefix(records)?
             .to_string_lossy()
             .replace('\\', "/");
+        let metadata = match crate::transcript_data::read_for_transcript(entry.path())? {
+            Some(metadata) => metadata.to_legacy_metadata()?,
+            None => {
+                let Some(frontmatter) = extract_frontmatter(&contents) else {
+                    continue;
+                };
+                let Ok(metadata) = serde_yaml::from_str::<Value>(frontmatter) else {
+                    continue;
+                };
+                metadata
+            }
+        };
         if let Some(match_evidence) = matching_evidence(&metadata, &relative_path, person) {
             matches.push(StorySource {
                 relative_path,
@@ -238,10 +244,17 @@ fn value_as_i32(value: &Value) -> Option<i32> {
 
 fn metadata_years(metadata: &Value) -> Vec<i32> {
     let mut years = metadata
-        .get("date_recorded")
+        .get("title_as_written")
         .and_then(value_as_text)
         .into_iter()
-        .flat_map(|date| years_in(&date))
+        .flat_map(|title| years_in(&title))
+        .chain(
+            metadata
+                .get("date_recorded")
+                .and_then(value_as_text)
+                .into_iter()
+                .flat_map(|date| years_in(&date)),
+        )
         .collect::<Vec<_>>();
     if let Some(dates) = metadata.get("all_extracted_dates") {
         collect_value_years(dates, &mut years);

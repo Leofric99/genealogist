@@ -111,9 +111,10 @@ PUID=$(id -u) PGID=$(id -g) docker compose up --build
    triggers a retry as groups of ten pages followed by consolidation.
 4. **Review the transcripts.** Open the generated Markdown files and correct
    uncertain names, dates, relationships, or table alignment against the scans.
-   Keep the YAML frontmatter intact where possible because audits and source
-   matching use it. Manual transcript edits are preserved for unchanged source
-   files.
+   The Markdown body is the authoritative transcription; a separate `.json`
+   file beside it contains AI-extracted person mentions and evidence-backed
+   facts. If you edit a transcript, the next scan regenerates its JSON from the
+   edited Markdown without retranscribing an unchanged source image.
 5. **Upload your GEDCOM and audit the evidence.** On **GEDCOM audit**, upload
    your `.ged` file, then run the audit. Review timeline, identity, and
    location findings as leads rather than proven errors; the report is saved
@@ -137,6 +138,14 @@ PUID=$(id -u) PGID=$(id -g) docker compose up --build
   consolidation pass.
 - Transcripts and page-level transcripts are written beside each source file
   or in the configured sidecar subfolder.
+- Each completed master Markdown transcript receives a matching `.json`
+  metadata file in a separate Gemini call that uses the Markdown transcription
+  as its input. Facts retain their source labels and values, and each fact must
+  quote and locate supporting transcript text. Invalid or failed extraction is
+  reported on the file row and retried on a later scan without retranscribing
+  the source when its Markdown is still current.
+- The CLI `scan` command reports unchanged transcripts missing valid JSON under
+  `metadata_pending`; run `process` or start a web scan to retry extraction.
 - Settings can keep sidecars beside each source or put them in a named
   subfolder inside each source's directory. The setting is saved in SQLite;
   scanning, direct processing, CLI delta checks, PDF page transcripts, GEDCOM
@@ -144,20 +153,23 @@ PUID=$(id -u) PGID=$(id -g) docker compose up --build
   configured sidecars. Changing the location moves existing master and
   per-page Markdown transcripts between the source directory and configured
   subfolder; original documents are never moved. A move is refused if it would
-  overwrite an existing transcript.
+  overwrite an existing transcript. A missing JSON companion is regenerated
+  beside its transcript on the next scan.
 - For PDF chunk fallback, a chunk for which Gemini returns no text is retained
   as a non-error placeholder and the other chunks continue through
   consolidation. The PDF is an error only when no chunk produced transcription
   text. Standalone images with no Gemini text response are indexed as empty
   rather than failed.
-- The default transcription prompt preserves table columns, row alignment,
+- The default transcription prompt produces body-only Markdown and preserves
+  table columns, row alignment,
   empty cells, and source order without assuming a particular document type.
   It explicitly separates multi-level column headings and printed form
   instructions from table data, asks for one row per person on census-style
   schedules, handles ditto surnames and side-by-side index blocks, and excludes
   website controls from digitized record screenshots. Existing exact copies of
   previous built-in prompts are upgraded on startup; custom prompts are left
-  unchanged.
+  unchanged. Older YAML-frontmatter transcripts remain readable by audit and
+  source-matching features.
 - API keys are encrypted in SQLite using a local encryption key. Back up the
   `.encryption-key` file along with the database; alternatively supply a stable
   64-hex-character `GOS_MASTER_KEY`.

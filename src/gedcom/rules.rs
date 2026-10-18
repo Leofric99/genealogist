@@ -18,6 +18,7 @@ pub struct Anomaly {
 struct TranscriptFrontmatter {
     primary_individuals: Option<serde_yaml::Value>,
     all_extracted_dates: Option<serde_yaml::Value>,
+    title_as_written: Option<String>,
 }
 
 pub fn check(gedcom: &Gedcom<'_>, transcript_dir: &Path) -> anyhow::Result<Vec<Anomaly>> {
@@ -188,23 +189,32 @@ fn check_duplicate_identity(
             continue;
         }
         let text = fs::read_to_string(entry.path())?;
-        let Some(frontmatter) = extract_frontmatter(&text) else {
-            continue;
-        };
-        let frontmatter: TranscriptFrontmatter = match serde_yaml::from_str(frontmatter) {
-            Ok(value) => value,
-            Err(_) => continue,
-        };
+        let frontmatter: TranscriptFrontmatter =
+            match crate::transcript_data::read_for_transcript(entry.path())? {
+                Some(metadata) => serde_yaml::from_value(metadata.to_legacy_metadata()?)?,
+                None => {
+                    let Some(frontmatter) = extract_frontmatter(&text) else {
+                        continue;
+                    };
+                    match serde_yaml::from_str(frontmatter) {
+                        Ok(value) => value,
+                        Err(_) => continue,
+                    }
+                }
+            };
         let identities = frontmatter
             .primary_individuals
             .as_ref()
             .map(identities)
             .unwrap_or_default();
-        let dates = frontmatter
+        let mut dates = frontmatter
             .all_extracted_dates
             .as_ref()
             .map(date_values)
             .unwrap_or_default();
+        if let Some(title) = frontmatter.title_as_written {
+            dates.push(title);
+        }
         for identity in identities {
             for date in &dates {
                 let Some(year) = date_year(date) else {

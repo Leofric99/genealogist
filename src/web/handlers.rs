@@ -421,7 +421,7 @@ pub async fn run_audit(State(state): State<Arc<AppState>>) -> Result<Json<Value>
         let gedcom_text = fs::read_to_string(&gedcom_path)?;
         let gedcom = parser::parse(&gedcom_text);
         let anomalies = rules::check(&gedcom, &records)?;
-        let facts = collect_frontmatter(&records)?;
+        let facts = collect_transcript_facts(&records)?;
         Ok((anomalies, facts))
     })
     .await??;
@@ -439,7 +439,7 @@ pub async fn run_audit(State(state): State<Arc<AppState>>) -> Result<Json<Value>
     };
     let narrative = if let Some(key) = key {
         let prompt = format!(
-            "Write a human-readable genealogy research anomaly audit. Explain each finding, distinguish evidence from uncertainty, and suggest cautious corrections. Do not claim facts not present in the data.\n\nRule violations:\n{}\n\nTranscript YAML frontmatter facts:\n{}",
+            "Write a human-readable genealogy research anomaly audit. Explain each finding, distinguish evidence from uncertainty, and suggest cautious corrections. Do not claim facts not present in the data.\n\nRule violations:\n{}\n\nStructured transcript JSON facts (legacy YAML frontmatter may appear for older transcripts):\n{}",
             serde_json::to_string_pretty(&anomalies)?,
             facts,
         );
@@ -522,7 +522,7 @@ pub async fn generate_story(
     if sources.is_empty() {
         return Err(ApiError(
             StatusCode::BAD_REQUEST,
-            "No matching transcript frontmatter was found; transcribe relevant records before generating a cited biography".to_owned(),
+            "No matching transcript metadata was found; transcribe relevant records before generating a cited biography".to_owned(),
         ));
     }
     let facts = person_facts(person, &graph);
@@ -594,7 +594,7 @@ fn data_directory(state: &AppState) -> PathBuf {
         .to_path_buf()
 }
 
-fn collect_frontmatter(records: &Path) -> anyhow::Result<String> {
+fn collect_transcript_facts(records: &Path) -> anyhow::Result<String> {
     let mut facts = Vec::new();
     if !records.is_dir() {
         return Ok(String::new());
@@ -607,8 +607,19 @@ fn collect_frontmatter(records: &Path) -> anyhow::Result<String> {
             continue;
         }
         let text = fs::read_to_string(entry.path())?;
-        if let Some(yaml) = frontmatter(&text) {
+        if let Some(metadata) = crate::transcript_data::read_for_transcript(entry.path())? {
+            facts.push(format!(
+                "{}:\n{}",
+                entry.path().display(),
+                serde_json::to_string_pretty(&metadata)?
+            ));
+        } else if let Some(yaml) = frontmatter(&text) {
             facts.push(format!("{}:\n{}", entry.path().display(), yaml));
+        } else {
+            facts.push(format!(
+                "{}:\n[No validated structured transcript JSON is available.]",
+                entry.path().display()
+            ));
         }
     }
     Ok(facts.join("\n\n"))

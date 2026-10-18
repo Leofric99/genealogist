@@ -129,6 +129,7 @@ impl GeminiClient {
         key: &str,
         parts: Vec<Value>,
         max_tokens: Option<u32>,
+        response_mime_type: Option<&str>,
     ) -> Result<GeneratedText> {
         let key_fingerprint = api_key_fingerprint(key);
         let active_model = self
@@ -139,7 +140,7 @@ impl GeminiClient {
             .cloned()
             .unwrap_or_else(|| model.to_owned());
         match self
-            .generate_on_model(&active_model, key, &parts, max_tokens)
+            .generate_on_model(&active_model, key, &parts, max_tokens, response_mime_type)
             .await
         {
             Ok(text) => Ok(GeneratedText {
@@ -159,7 +160,7 @@ impl GeminiClient {
                     .filter(|alternate| alternate != &active_model)
                 {
                     match self
-                        .generate_on_model(&alternate, key, &parts, max_tokens)
+                        .generate_on_model(&alternate, key, &parts, max_tokens, response_mime_type)
                         .await
                     {
                         Ok(text) => {
@@ -247,10 +248,14 @@ impl GeminiClient {
         key: &str,
         parts: &[Value],
         max_tokens: Option<u32>,
+        response_mime_type: Option<&str>,
     ) -> Result<String> {
         let mut generation_config = json!({ "temperature": 0.1 });
         if let Some(max_tokens) = max_tokens {
             generation_config["maxOutputTokens"] = json!(max_tokens);
+        }
+        if let Some(response_mime_type) = response_mime_type {
+            generation_config["responseMimeType"] = json!(response_mime_type);
         }
         for attempt in 0..MAX_API_ATTEMPTS {
             self.limiter.until_ready().await;
@@ -361,6 +366,7 @@ impl GeminiClient {
                 json!({ "inlineData": { "mimeType": mime, "data": STANDARD.encode(bytes) } }),
             ],
             None,
+            None,
         ).await?.text;
         let normalized = answer
             .trim()
@@ -419,6 +425,7 @@ impl GeminiClient {
                     json!({ "inlineData": { "mimeType": mime, "data": STANDARD.encode(bytes) } }),
                 ],
                 None,
+                None,
             )
             .await?;
         Ok(normalize_transcript(&raw.text))
@@ -445,9 +452,30 @@ impl GeminiClient {
                 key,
                 vec![json!({ "text": format!("{instructions}\n\n{combined}") })],
                 None,
+                None,
             )
             .await?;
         Ok(normalize_transcript(&raw.text))
+    }
+
+    pub async fn extract_transcript_metadata(
+        &self,
+        transcript: &str,
+        key: &str,
+    ) -> Result<crate::transcript_data::ExtractionPayload> {
+        let prompt = format!(
+            "Extract person mentions and evidence-backed facts from the Markdown transcription below. The Markdown is the only source of evidence. Do not use filenames, outside knowledge, or assumptions.\n\nReturn exactly one JSON object with these keys:\n- document_type: a concise string; use \"unknown\" only if the transcript provides no reasonable basis.\n- title_as_written: a string only when a document title is actually transcribed; otherwise null.\n- person_mentions: an array with one item for each distinct named person entry or person discussed. Keep separate entries separate, even when their names are identical. Do not merge people. Each item has name_as_written and facts.\n- facts: an array of objects with label, value, evidence, and optional concept, attribution, and assertion_status. Use the source's field label where available; preserve each value as written. Omit facts not present rather than returning null values.\n- evidence: an object with quote and location. quote must be an exact, contiguous quotation from the Markdown. location must identify the section, page, table row, and/or field as available.\n- concept: include only a concise reusable concept when clear (such as age, birth_date, birthplace, residence, occupation, relationship, event_date, or event_place); otherwise omit it.\n- attribution: when a claim is reported by a letter writer, witness, or other source, identify that attribution. assertion_status should distinguish recorded, reported, alleged, or inferred claims where relevant.\n\nDo not treat headings, column labels, dates, places, or organizations as people. Preserve uncertainty, avoid resolving ambiguous identities, and do not infer a person's identity from a surname alone. Return an empty person_mentions array if no named people are present. Do not include IDs, hashes, paths, confidence scores, or Markdown fences.\n\nMarkdown transcription:\n{transcript}"
+        );
+        let response = self
+            .generate(
+                &self.model,
+                key,
+                vec![json!({ "text": prompt })],
+                None,
+                Some("application/json"),
+            )
+            .await?;
+        crate::transcript_data::parse_extraction(&response.text, transcript)
     }
 
     pub async fn test_key(&self, key: &str) -> Result<String> {
@@ -456,6 +484,7 @@ impl GeminiClient {
                 &self.validation_model,
                 key,
                 vec![json!({ "text": "Reply with OK." })],
+                None,
                 None,
             )
             .await?;
@@ -467,7 +496,13 @@ impl GeminiClient {
 
     pub async fn text_prompt(&self, key: &str, prompt: &str) -> Result<String> {
         Ok(self
-            .generate(&self.model, key, vec![json!({ "text": prompt })], None)
+            .generate(
+                &self.model,
+                key,
+                vec![json!({ "text": prompt })],
+                None,
+                None,
+            )
             .await?
             .text)
     }
@@ -529,71 +564,20 @@ pub fn mime_for_path(path: &Path) -> &'static str {
 
 pub fn normalize_transcript(raw: &str) -> String {
     let trimmed = raw.trim();
-    let mut metadata = serde_yaml::Mapping::new();
     if let Some(rest) = trimmed.strip_prefix("---") {
         if let Some(end) = rest.find("\n---") {
             let yaml_text = &rest[..end];
             let body = rest[end + 4..]
                 .trim_start_matches(|character| character == '\r' || character == '\n');
-            if let Ok(serde_yaml::Value::Mapping(parsed)) =
-                serde_yaml::from_str::<serde_yaml::Value>(yaml_text)
-            {
-                metadata = parsed;
-                ensure_metadata_fields(&mut metadata);
-                return render_transcript(&metadata, body);
+            if matches!(
+                serde_yaml::from_str::<serde_yaml::Value>(yaml_text),
+                Ok(serde_yaml::Value::Mapping(_))
+            ) {
+                return format!("{}\n", body.trim());
             }
         }
     }
-    ensure_metadata_fields(&mut metadata);
-    render_transcript(&metadata, trimmed)
-}
-
-fn ensure_metadata_fields(metadata: &mut serde_yaml::Mapping) {
-    let fields = [
-        ("document_type", serde_yaml::Value::Null),
-        ("date_recorded", serde_yaml::Value::Null),
-        ("location_recorded", serde_yaml::Value::Null),
-        (
-            "primary_individuals",
-            serde_yaml::Value::Sequence(Vec::new()),
-        ),
-        (
-            "all_extracted_dates",
-            serde_yaml::Value::Sequence(Vec::new()),
-        ),
-        ("transcription_confidence", serde_yaml::Value::Null),
-    ];
-    for (key, default) in fields {
-        metadata
-            .entry(serde_yaml::Value::String(key.to_owned()))
-            .or_insert(default);
-    }
-    if let Some(serde_yaml::Value::Sequence(individuals)) =
-        metadata.get_mut(serde_yaml::Value::String("primary_individuals".to_owned()))
-    {
-        for individual in individuals {
-            if let serde_yaml::Value::String(name) = individual {
-                let mut person = serde_yaml::Mapping::new();
-                person.insert(
-                    serde_yaml::Value::String("name".to_owned()),
-                    serde_yaml::Value::String(name.clone()),
-                );
-                *individual = serde_yaml::Value::Mapping(person);
-            }
-            if let serde_yaml::Value::Mapping(person) = individual {
-                for key in ["name", "role", "age", "occupation", "birthplace"] {
-                    person
-                        .entry(serde_yaml::Value::String(key.to_owned()))
-                        .or_insert(serde_yaml::Value::Null);
-                }
-            }
-        }
-    }
-}
-
-fn render_transcript(metadata: &serde_yaml::Mapping, body: &str) -> String {
-    let yaml = serde_yaml::to_string(metadata).unwrap_or_else(|_| String::new());
-    format!("---\n{}---\n\n{}\n", yaml, body.trim())
+    format!("{}\n", trimmed)
 }
 
 #[cfg(test)]
@@ -678,26 +662,11 @@ mod tests {
     }
 
     #[test]
-    fn transcript_always_has_required_frontmatter_fields() {
+    fn transcript_removes_legacy_frontmatter() {
         let transcript = normalize_transcript(
             "---\ndocument_type: birth register\nprimary_individuals:\n  - name: Ada\n---\n| Name | Age |\n| --- | --- |\n| Ada | 12 |",
         );
-        let content = transcript
-            .strip_prefix("---\n")
-            .expect("frontmatter opener");
-        let end = content.find("\n---").expect("frontmatter terminator");
-        let metadata: serde_yaml::Value =
-            serde_yaml::from_str(&content[..end]).expect("valid generated YAML");
-        for field in [
-            "document_type",
-            "date_recorded",
-            "location_recorded",
-            "primary_individuals",
-            "all_extracted_dates",
-            "transcription_confidence",
-        ] {
-            assert!(metadata.get(field).is_some(), "missing {field}");
-        }
+        assert!(!transcript.starts_with("---"));
         assert!(transcript.contains("| Ada | 12 |"));
     }
 

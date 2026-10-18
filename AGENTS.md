@@ -7,15 +7,17 @@
 - SQLite is the durable source of truth for settings, file hashes/statuses, and
   the current queue job. Keep blocking rusqlite and filesystem work off async
   request paths where it may become long-running.
-- Transcripts use YAML frontmatter followed by Markdown and are stored beside
-  the source image/PDF or in the user's configured sidecar subfolder. Resolve
-  all master and page-level transcript paths through `src/sidecar.rs`. Settings
-  are persisted in SQLite; scanner delta checks, direct/CLI processing, GEDCOM
-  audits, and Life Story discovery must remain compatible with either layout.
-  When a user changes sidecar layout, relocate only transcript Markdown files;
-  never move source documents, and refuse collisions rather than overwrite.
-  Do not overwrite a transcript for an unchanged file when it already exists
-  at the configured path.
+- Transcripts are body-only Markdown, stored beside the source image/PDF or in
+  the user's configured sidecar subfolder. A separate JSON companion stores
+  extracted person mentions and evidence-backed facts. Resolve all master and
+  page-level transcript paths through `src/sidecar.rs`. Settings are persisted
+  in SQLite; scanner delta checks, direct/CLI processing, GEDCOM audits, and
+  Life Story discovery must remain compatible with either layout. When a user
+  changes sidecar layout, relocate only transcript Markdown files; never move
+  source documents, and refuse collisions rather than overwrite. Missing JSON
+  companions are regenerated from the transcript on the next scan. Do not
+  overwrite a transcript for an unchanged file when it already exists at the
+  configured path.
 - Keep the default transcription prompt format-agnostic. Its table guidance
   should preserve source row/column relationships, require consistent cell
   counts, and use compact Markdown separators rather than content-width padding.
@@ -23,6 +25,11 @@
   continuation and side-by-side index blocks explicitly without over-inference.
 - When changing the built-in prompt, migrate only an exact match of the prior
   built-in text so saved custom prompts remain untouched.
+- Run structured extraction as a separate Gemini call after transcription,
+  using the Markdown transcript as input. Keep source labels and values,
+  require exact transcript evidence for each fact, and leave ambiguous person
+  matches unresolved. Existing audit and Life Story consumers must read JSON
+  companions while retaining compatibility with legacy YAML-frontmatter files.
 - Life story source matching lives in `src/web/story_sources.rs`; keep fuzzy
   name matches dependent on independent GEDCOM/transcript/path corroboration.
   `src/web/story_format.rs` validates per-section confidence and transcript
