@@ -23,6 +23,10 @@
   counts, and use compact Markdown separators rather than content-width padding.
   Keep headings/instructions separate from table values; preserve ditto marks
   literally in Markdown. Keep side-by-side index blocks explicitly separated.
+  `src/gemini_client.rs` appends a mandatory whole-image layout rule to prompts
+  for all MIME types: open-book pages, partial neighboring-page strips, and
+  columns stay separate, and processing must cover the full image without
+  cropping. Keep that rule format-agnostic and preserve it for custom prompts.
 - When changing the built-in prompt, migrate only an exact match of the prior
   built-in text so saved custom prompts remain untouched.
 - Life Story discovery lives in `src/web/story_sources.rs`; match source

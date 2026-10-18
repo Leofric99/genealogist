@@ -167,7 +167,10 @@ PUID=$(id -u) PGID=$(id -g) docker compose up --build
   Gemini to return a structured non-document marker for clear photographs and
   artwork; those images are saved as `filtered` without Markdown or later
   retries unless their source changes. Existing exact copies of previous
-  built-in prompts are upgraded on startup; custom prompts are left unchanged.
+  built-in prompts are upgraded on startup; custom prompt text is left
+  unchanged. At request time, a whole-image layout rule is appended to both
+  built-in and custom prompts so open-book spreads, partial adjacent pages, and
+  independent columns are transcribed separately without cropping the source.
 - Life Story discovery searches transcript bodies and paths using the GEDCOM
   person's name, dates, places, and related people. Candidate matches are
   stored in SQLite as suggested, confirmed, or rejected links, keyed by the

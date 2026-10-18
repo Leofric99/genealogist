@@ -20,13 +20,16 @@ pub const NO_PAGE_TEXT_MARKER: &str =
     "[No transcription text was returned for this page; its content is undetermined.]";
 pub const NON_DOCUMENT_MARKER: &str = "GENESLEUTH_NON_DOCUMENT";
 
+const WHOLE_IMAGE_LAYOUT_INVARIANT: &str = "Whole-image page and spread rule: process the complete supplied image; do not assume it contains only one page or ignore regions outside the apparent main page. For an open book or register, identify each physical page separately, then transcribe each printed column or list top-to-bottom before moving to the next column from left to right. Never read horizontally across neighboring columns or merge their same-height rows. Keep a partial neighboring or previous-page strip in a separate clearly labeled section; transcribe only what is visible there, do not continue rows across a gutter or edge, and do not carry headings or surnames across page or column boundaries. Preserve visible page, quarter/year, range, and column headings with the entries they govern. In alphabetical indexes, keep each entry's name, district, volume, and page together in its visible row; carry a printed surname only within its own continuous column/group and reset it at a new heading, column, or page. Distinguish actual print or handwriting from gutter shadows, show-through, page curl, and scan artifacts; do not report repeated ghost impressions as marginal notes or duplicate entries. Do not deduplicate distinct rows just because names or references match. Transcribe every visible block through its last visible entry; mark cut-off or uncertain text locally instead of guessing or omitting it. Do not infer missing text from the filename or expected person.";
+
 const IMAGE_PROMPT_INVARIANT: &str = "Mandatory image-only safety rule: if the supplied image is clearly a general photograph, painting, illustration, or other non-document without meaningful historical text, return exactly GENESLEUTH_NON_DOCUMENT and nothing else. Do not use this marker for a scan, screenshot, or photograph of a document.";
 
 fn transcription_prompt_for_mime(system_prompt: &str, mime: &str) -> String {
+    let prompt = format!("{system_prompt}\n\n{WHOLE_IMAGE_LAYOUT_INVARIANT}");
     if mime.starts_with("image/") {
-        format!("{system_prompt}\n\n{IMAGE_PROMPT_INVARIANT}")
+        format!("{prompt}\n\n{IMAGE_PROMPT_INVARIANT}")
     } else {
-        system_prompt.to_owned()
+        prompt
     }
 }
 
@@ -614,11 +617,11 @@ mod tests {
 
         let image_prompt = super::transcription_prompt_for_mime("custom prompt", "image/jpeg");
         assert!(image_prompt.starts_with("custom prompt"));
+        assert!(image_prompt.contains("Whole-image page and spread rule"));
         assert!(image_prompt.contains(super::NON_DOCUMENT_MARKER));
-        assert_eq!(
-            super::transcription_prompt_for_mime("custom prompt", "application/pdf"),
-            "custom prompt"
-        );
+        let pdf_prompt = super::transcription_prompt_for_mime("custom prompt", "application/pdf");
+        assert!(pdf_prompt.contains("Whole-image page and spread rule"));
+        assert!(!pdf_prompt.contains(super::NON_DOCUMENT_MARKER));
     }
 
     #[test]
