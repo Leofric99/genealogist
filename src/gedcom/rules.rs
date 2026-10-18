@@ -2,6 +2,7 @@ use super::{
     graph::FamilyGraph,
     parser::{date_year, Gedcom},
 };
+use crate::scanner::DirectoryExclusions;
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, fs, path::Path};
 
@@ -15,11 +16,19 @@ pub struct Anomaly {
 }
 
 pub fn check(gedcom: &Gedcom<'_>, transcript_dir: &Path) -> anyhow::Result<Vec<Anomaly>> {
+    check_with_exclusions(gedcom, transcript_dir, &DirectoryExclusions::default())
+}
+
+pub fn check_with_exclusions(
+    gedcom: &Gedcom<'_>,
+    transcript_dir: &Path,
+    exclusions: &DirectoryExclusions,
+) -> anyhow::Result<Vec<Anomaly>> {
     let graph = FamilyGraph::build(gedcom);
     let mut anomalies = Vec::new();
     check_parent_timeline(gedcom, &graph, &mut anomalies);
     check_travel(gedcom, &mut anomalies);
-    check_duplicate_identity(gedcom, transcript_dir, &mut anomalies)?;
+    check_duplicate_identity(gedcom, transcript_dir, exclusions, &mut anomalies)?;
     Ok(anomalies)
 }
 
@@ -143,6 +152,7 @@ fn date_day_of_year(date: &str) -> Option<u32> {
 fn check_duplicate_identity(
     gedcom: &Gedcom<'_>,
     transcript_dir: &Path,
+    exclusions: &DirectoryExclusions,
     anomalies: &mut Vec<Anomaly>,
 ) -> anyhow::Result<()> {
     let mut known: HashMap<(String, i32), Vec<String>> = HashMap::new();
@@ -174,7 +184,20 @@ fn check_duplicate_identity(
     if !transcript_dir.is_dir() {
         return Ok(());
     }
-    for entry in walkdir::WalkDir::new(transcript_dir).follow_links(false) {
+    for entry in walkdir::WalkDir::new(transcript_dir)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|entry| {
+            if entry.depth() == 0 {
+                return true;
+            }
+            !entry.file_name().to_string_lossy().starts_with('.')
+                && entry
+                    .path()
+                    .strip_prefix(transcript_dir)
+                    .is_ok_and(|relative| !exclusions.contains_relative(relative))
+        })
+    {
         let entry = entry?;
         if !entry.file_type().is_file()
             || entry.path().extension().and_then(|ext| ext.to_str()) != Some("md")
@@ -226,8 +249,9 @@ fn normalize_name(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::check;
+    use super::{check, check_with_exclusions};
     use crate::gedcom::parser;
+    use crate::scanner::DirectoryExclusions;
 
     #[test]
     fn flags_implausible_maternal_age_and_birth_after_death() {
@@ -262,5 +286,29 @@ mod tests {
                     .as_deref()
                     .is_some_and(|path| path.ends_with("register.md"))
         }));
+    }
+
+    #[test]
+    fn excluded_folders_are_omitted_from_transcript_identity_checks() {
+        let input = "0 @I1@ INDI\n1 NAME Ada /Example/\n1 BIRT\n2 DATE 1900\n0 @I2@ INDI\n1 NAME Ada /Example/\n1 BIRT\n2 DATE 1900\n";
+        let gedcom = parser::parse(input);
+        let directory = tempfile::tempdir().expect("temporary transcript directory");
+        let photos = directory.path().join("Family Photos");
+        std::fs::create_dir_all(&photos).expect("create excluded directory");
+        std::fs::write(
+            photos.join("register.md"),
+            "Birth register entry: Ada Example, 1900.",
+        )
+        .expect("write transcript");
+        let exclusions = DirectoryExclusions::parse("Family Photos").unwrap();
+
+        let findings = check_with_exclusions(&gedcom, directory.path(), &exclusions).unwrap();
+        assert!(!findings
+            .iter()
+            .any(|finding| finding.rule == "ambiguous_transcript_identity"));
+        assert!(check(&gedcom, directory.path())
+            .unwrap()
+            .iter()
+            .any(|finding| finding.rule == "ambiguous_transcript_identity"));
     }
 }

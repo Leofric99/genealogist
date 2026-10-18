@@ -2,7 +2,7 @@ use crate::{
     config::DEFAULT_SYSTEM_PROMPT,
     db::{FileStatus, JobStatus},
     gedcom::{parser, rules},
-    queue,
+    queue, scanner,
     sidecar::SidecarConfig,
     state::{api_key, AppState},
     web::{
@@ -54,6 +54,7 @@ pub struct SettingsResponse {
     pub system_prompt: String,
     pub sidecar_mode: String,
     pub sidecar_folder: String,
+    pub excluded_folders: String,
 }
 
 #[derive(Deserialize)]
@@ -62,6 +63,7 @@ pub struct SaveSettingsRequest {
     pub system_prompt: Option<String>,
     pub sidecar_mode: Option<String>,
     pub sidecar_folder: Option<String>,
+    pub excluded_folders: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -276,6 +278,7 @@ pub async fn get_settings(
             .is_some_and(|key| !key.trim().is_empty())
     };
     let sidecars = SidecarConfig::load(&state.db)?;
+    let excluded_folders = scanner::DirectoryExclusions::load(&state.db)?;
     Ok(Json(SettingsResponse {
         has_api_key,
         system_prompt: state
@@ -284,6 +287,7 @@ pub async fn get_settings(
             .unwrap_or_else(|| DEFAULT_SYSTEM_PROMPT.to_owned()),
         sidecar_mode: sidecars.mode().to_owned(),
         sidecar_folder: sidecars.folder().to_owned(),
+        excluded_folders: excluded_folders.as_text(),
     }))
 }
 
@@ -311,6 +315,22 @@ pub async fn save_settings(
             "System prompt exceeds 100,000 characters".to_owned(),
         ));
     }
+    if request
+        .excluded_folders
+        .as_deref()
+        .is_some_and(|folders| folders.len() > 20_000)
+    {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            "Excluded folder list exceeds 20,000 characters".to_owned(),
+        ));
+    }
+    let excluded_folders = request
+        .excluded_folders
+        .as_deref()
+        .map(scanner::DirectoryExclusions::parse)
+        .transpose()
+        .map_err(|error| ApiError(StatusCode::BAD_REQUEST, error.to_string()))?;
     let sidecars = if request.sidecar_mode.is_some() || request.sidecar_folder.is_some() {
         let current = SidecarConfig::load(&state.db)?;
         let mode = request
@@ -355,6 +375,11 @@ pub async fn save_settings(
     }
     if let Some(prompt) = request.system_prompt {
         state.db.set_setting("system_prompt", prompt.trim())?;
+    }
+    if let Some(excluded_folders) = excluded_folders {
+        state
+            .db
+            .set_setting("excluded_folders", &excluded_folders.as_text())?;
     }
     Ok(Json(json!({ "saved": true })))
 }
@@ -440,11 +465,12 @@ pub async fn run_audit(State(state): State<Arc<AppState>>) -> Result<Json<Value>
             )
         })?;
     let records = state.config.records_dir.clone();
+    let exclusions = scanner::DirectoryExclusions::load(&state.db)?;
     let report_path = state.config.output_dir.join("audit-report.md");
     let anomalies = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
         let gedcom_text = fs::read_to_string(&gedcom_path)?;
         let gedcom = parser::parse(&gedcom_text);
-        rules::check(&gedcom, &records)
+        rules::check_with_exclusions(&gedcom, &records, &exclusions)
     })
     .await??;
     let key = if state.db.setting("gemini_api_key")?.is_some()
@@ -904,9 +930,16 @@ pub async fn update_story_source_link(
     })?;
     let identity = person_identity(&xref, person, &graph, &tree_key);
     let records = state.config.records_dir.clone();
+    let exclusions = scanner::DirectoryExclusions::load(&state.db)?;
     let relative_path = request.transcript_path.clone();
+    if exclusions.contains_relative(Path::new(&relative_path)) {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            "Transcript is inside an excluded folder".to_owned(),
+        ));
+    }
     let transcript = tokio::task::spawn_blocking(move || {
-        story_sources::read_transcript(&records, &relative_path)
+        story_sources::read_transcript_with_exclusions(&records, &relative_path, &exclusions)
     })
     .await??
     .ok_or_else(|| {
@@ -956,8 +989,14 @@ async fn select_story_sources(
 ) -> Result<Vec<story_sources::StorySource>> {
     let records_root = records.to_path_buf();
     let person = identity.clone();
+    let exclusions = scanner::DirectoryExclusions::load(&state.db)?;
+    let discovery_exclusions = exclusions.clone();
     let discovered = tokio::task::spawn_blocking(move || {
-        story_sources::collect_person_sources(&records_root, &person)
+        story_sources::collect_person_sources_with_exclusions(
+            &records_root,
+            &person,
+            &discovery_exclusions,
+        )
     })
     .await??;
     let person_key = identity.stable_key();
@@ -981,7 +1020,10 @@ async fn select_story_sources(
         .collect::<HashMap<_, _>>();
     let mut confirmed_to_load = Vec::new();
     for link in &links {
-        if link.status == "confirmed" && !selected.contains_key(&link.transcript_path) {
+        if link.status == "confirmed"
+            && !selected.contains_key(&link.transcript_path)
+            && !exclusions.contains_relative(Path::new(&link.transcript_path))
+        {
             confirmed_to_load.push(link.clone());
         }
         if let Some(source) = selected.get_mut(&link.transcript_path) {
@@ -993,13 +1035,17 @@ async fn select_story_sources(
 
     if !confirmed_to_load.is_empty() {
         let records_root = records.to_path_buf();
+        let link_exclusions = exclusions;
         let loaded = tokio::task::spawn_blocking(move || {
             confirmed_to_load
                 .into_iter()
                 .filter_map(|link| {
-                    let result =
-                        story_sources::read_transcript(&records_root, &link.transcript_path)
-                            .map(|source| source.map(|source| (link, source)));
+                    let result = story_sources::read_transcript_with_exclusions(
+                        &records_root,
+                        &link.transcript_path,
+                        &link_exclusions,
+                    )
+                    .map(|source| source.map(|source| (link, source)));
                     Some(result)
                 })
                 .collect::<Result<Vec<_>>>()
@@ -1030,18 +1076,25 @@ async fn load_confirmed_story_sources(
     records: &Path,
     identity: &PersonIdentity,
 ) -> Result<Vec<story_sources::StorySource>> {
+    let exclusions = scanner::DirectoryExclusions::load(&state.db)?;
     let links = state
         .db
         .transcript_person_links(&identity.stable_key())?
         .into_iter()
-        .filter(|link| link.status == "confirmed")
+        .filter(|link| {
+            link.status == "confirmed"
+                && !exclusions.contains_relative(Path::new(&link.transcript_path))
+        })
         .collect::<Vec<_>>();
     let records_root = records.to_path_buf();
     tokio::task::spawn_blocking(move || {
         let mut sources = Vec::new();
         for link in links {
-            let Some(mut source) =
-                story_sources::read_transcript(&records_root, &link.transcript_path)?
+            let Some(mut source) = story_sources::read_transcript_with_exclusions(
+                &records_root,
+                &link.transcript_path,
+                &exclusions,
+            )?
             else {
                 continue;
             };

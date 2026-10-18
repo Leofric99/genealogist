@@ -1,7 +1,7 @@
 use crate::{
     config::DEFAULT_SYSTEM_PROMPT,
     db::JobStatus,
-    scanner::{self, ScannedFile},
+    scanner::{self, DirectoryExclusions, ScannedFile},
     sidecar::SidecarConfig,
     state::{api_key, AppState},
     vision_filter,
@@ -41,9 +41,10 @@ pub async fn run_scan(state: Arc<AppState>) -> Result<()> {
     publish_status(&state).await;
     let root = state.config.records_dir.clone();
     let sidecars = SidecarConfig::load(&state.db)?;
+    let exclusions = DirectoryExclusions::load(&state.db)?;
     let scan_cancellation = cancellation.clone();
     let files = tokio::task::spawn_blocking(move || {
-        scanner::scan_and_hash_cancellable(&root, &scan_cancellation)
+        scanner::scan_and_hash_cancellable_with_exclusions(&root, &exclusions, &scan_cancellation)
     })
     .await??;
     let Some(files) = files else {
@@ -442,6 +443,10 @@ pub fn progress_snapshot(state: &AppState) -> Result<JobStatus> {
 pub async fn direct_process(state: &AppState, path: &Path) -> Result<String> {
     if !scanner::is_supported(path) {
         anyhow::bail!("unsupported file extension: {}", path.display());
+    }
+    let exclusions = DirectoryExclusions::load(&state.db)?;
+    if exclusions.contains_path(&state.config.records_dir, path) {
+        anyhow::bail!("file is inside an excluded folder: {}", path.display());
     }
     let hash_path = path.to_path_buf();
     let one = tokio::task::spawn_blocking(move || scanner::hash_file(&hash_path)).await??;

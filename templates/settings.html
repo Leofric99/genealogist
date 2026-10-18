@@ -15,7 +15,7 @@
   </div>
   <div class="card">
     <h2>Transcription system prompt</h2>
-    <p class="muted">The default directive requests exhaustive extraction and structured YAML frontmatter. Custom instructions should preserve those output requirements.</p>
+    <p class="muted">The default directive requests exhaustive body-only Markdown. The application also appends document-layout and safety instructions to each transcription request.</p>
     <label>Prompt
       <textarea x-model="systemPrompt" rows="14"></textarea>
     </label>
@@ -35,6 +35,14 @@
     </label>
     <button type="button" class="secondary" @click="save()">Save sidecar settings</button>
   </div>
+  <div class="card">
+    <h2>Excluded folders</h2>
+    <p class="muted">Enter folder paths relative to the records directory, one per line (for example, <code>Family Photos</code> or <code>Scans/Unsorted</code>). These folders and their contents are ignored by future scans, direct processing, transcript discovery, and GEDCOM transcript checks. Existing files and transcripts are not deleted.</p>
+    <label>Folders to exclude
+      <textarea x-model="excludedFolders" rows="6" maxlength="20000" placeholder="Family Photos&#10;Scans/Unsorted"></textarea>
+    </label>
+    <button type="button" class="secondary" @click="save()">Save excluded folders</button>
+  </div>
 </section>
 <script>
 function settingsPage() {
@@ -43,6 +51,7 @@ function settingsPage() {
     systemPrompt: "",
     sidecarMode: "same_directory",
     sidecarFolder: "transcripts",
+    excludedFolders: "",
     keyState: "",
     message: "",
     async load() {
@@ -54,6 +63,7 @@ function settingsPage() {
         this.systemPrompt = data.system_prompt;
         this.sidecarMode = data.sidecar_mode;
         this.sidecarFolder = data.sidecar_folder;
+        this.excludedFolders = data.excluded_folders;
       } catch (error) { this.message = error.message; }
     },
     async save() {
@@ -65,7 +75,8 @@ function settingsPage() {
             api_key: this.apiKey,
             system_prompt: this.systemPrompt,
             sidecar_mode: this.sidecarMode,
-            sidecar_folder: this.sidecarFolder
+            sidecar_folder: this.sidecarFolder,
+            excluded_folders: this.excludedFolders
           })
         });
         const data = await response.json();

@@ -101,8 +101,12 @@ PUID=$(id -u) PGID=$(id -g) docker compose up --build
    and test your Gemini API key, choose the transcription prompt, and select
    where transcripts should be stored. In subfolder mode, choose a simple
    folder name; that folder is created inside each source document's directory.
-   Changing this choice later moves existing transcription files (including
-   split-PDF page transcripts) to the selected layout without moving originals.
+   Add any folders to exclude as paths relative to the records directory, one
+   per line (for example, `Family Photos`); their contents will not be scanned
+   or used for transcript discovery.
+   Changing the transcript storage choice later moves existing transcription
+   files (including split-PDF page transcripts) to the selected layout without
+   moving originals.
 3. **Scan the records.** From the Dashboard, select **Scan records directory**
    and monitor the saved progress. You can leave the page and reconnect later;
    completed transcripts remain on disk. Use **Stop scan** to cancel remaining
@@ -152,6 +156,11 @@ PUID=$(id -u) PGID=$(id -g) docker compose up --build
   and per-page Markdown transcripts between the source directory and configured
   subfolder; original documents are never moved. A move is refused if it would
   overwrite an existing transcript.
+- Excluded folders are relative to the records directory and are pruned from
+  web/CLI scans. Direct processing, transcript discovery, and transcript-based
+  GEDCOM checks also ignore them. Excluding a folder does not delete its files,
+  transcripts, or existing database rows; the setting applies to subsequent
+  processing.
 - For PDF chunk fallback, a chunk for which Gemini returns no text is retained
   as a non-error placeholder and the other chunks continue through
   consolidation. The PDF is an error only when no chunk produced transcription

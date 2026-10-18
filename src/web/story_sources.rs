@@ -1,3 +1,4 @@
+use crate::scanner::DirectoryExclusions;
 use anyhow::{bail, Context, Result};
 use sha2::{Digest, Sha256};
 use std::{
@@ -46,6 +47,14 @@ pub struct StorySource {
 }
 
 pub fn collect_person_sources(records: &Path, person: &PersonIdentity) -> Result<Vec<StorySource>> {
+    collect_person_sources_with_exclusions(records, person, &DirectoryExclusions::default())
+}
+
+pub fn collect_person_sources_with_exclusions(
+    records: &Path,
+    person: &PersonIdentity,
+    exclusions: &DirectoryExclusions,
+) -> Result<Vec<StorySource>> {
     let mut matches = Vec::new();
     if !records.is_dir() {
         return Ok(matches);
@@ -55,7 +64,14 @@ pub fn collect_person_sources(records: &Path, person: &PersonIdentity) -> Result
         .follow_links(false)
         .into_iter()
         .filter_entry(|entry| {
-            entry.depth() == 0 || !entry.file_name().to_string_lossy().starts_with('.')
+            if entry.depth() == 0 {
+                return true;
+            }
+            !entry.file_name().to_string_lossy().starts_with('.')
+                && entry
+                    .path()
+                    .strip_prefix(records)
+                    .is_ok_and(|relative| !exclusions.contains_relative(relative))
         })
     {
         let entry = entry?;
@@ -101,6 +117,14 @@ pub fn collect_person_sources(records: &Path, person: &PersonIdentity) -> Result
 }
 
 pub fn read_transcript(records: &Path, relative_path: &str) -> Result<Option<StorySource>> {
+    read_transcript_with_exclusions(records, relative_path, &DirectoryExclusions::default())
+}
+
+pub fn read_transcript_with_exclusions(
+    records: &Path,
+    relative_path: &str,
+    exclusions: &DirectoryExclusions,
+) -> Result<Option<StorySource>> {
     let relative = Path::new(relative_path);
     if relative.as_os_str().is_empty()
         || relative
@@ -108,6 +132,9 @@ pub fn read_transcript(records: &Path, relative_path: &str) -> Result<Option<Sto
             .any(|component| !matches!(component, Component::Normal(_)))
     {
         bail!("transcript path must be a normalized path relative to the records directory");
+    }
+    if exclusions.contains_relative(relative) {
+        bail!("linked transcript is inside an excluded folder");
     }
     if !relative
         .extension()
@@ -336,7 +363,11 @@ fn sha256_text(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{collect_person_sources, read_transcript, PersonIdentity};
+    use super::{
+        collect_person_sources, collect_person_sources_with_exclusions, read_transcript,
+        read_transcript_with_exclusions, PersonIdentity,
+    };
+    use crate::scanner::DirectoryExclusions;
     use std::fs;
 
     #[test]
@@ -427,5 +458,39 @@ mod tests {
         let directory = tempfile::tempdir().expect("temporary records directory");
         assert!(read_transcript(directory.path(), "../outside.md").is_err());
         assert!(read_transcript(directory.path(), "source.jpg").is_err());
+    }
+
+    #[test]
+    fn excluded_folders_are_not_discovered_or_loaded_as_story_sources() {
+        let directory = tempfile::tempdir().expect("temporary records directory");
+        let photos = directory.path().join("Family Photos");
+        fs::create_dir_all(&photos).expect("create excluded directory");
+        let transcript = photos.join("Arthur Astle 1870.md");
+        fs::write(&transcript, "Arthur Astle, born 1870.").expect("write transcript");
+        let person = PersonIdentity {
+            xref: "@I1@".to_owned(),
+            name: "Arthur Astle".to_owned(),
+            birth_year: Some(1870),
+            ..PersonIdentity::default()
+        };
+        let exclusions = DirectoryExclusions::parse("Family Photos").unwrap();
+
+        assert!(
+            collect_person_sources_with_exclusions(directory.path(), &person, &exclusions)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(read_transcript_with_exclusions(
+            directory.path(),
+            "Family Photos/Arthur Astle 1870.md",
+            &exclusions
+        )
+        .is_err());
+        assert!(
+            collect_person_sources(directory.path(), &person)
+                .unwrap()
+                .len()
+                == 1
+        );
     }
 }

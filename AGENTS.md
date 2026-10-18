@@ -7,6 +7,11 @@
 - SQLite is the durable source of truth for settings, file hashes/statuses, and
   the current queue job. Keep blocking rusqlite and filesystem work off async
   request paths where it may become long-running.
+- `scanner::DirectoryExclusions` parses the persisted newline-separated
+  relative folder list. Apply it consistently to recursive scans, direct
+  processing, GEDCOM transcript checks, and Life Story transcript discovery;
+  never allow absolute paths or parent traversal in the setting. Exclusions
+  preserve source files, transcripts, and existing database rows.
 - Transcripts are body-only Markdown, stored beside the source image/PDF or in
   the user's configured sidecar subfolder. Markdown is the only generated
   per-document sidecar: do not add frontmatter or JSON extraction. Resolve all

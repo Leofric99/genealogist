@@ -61,6 +61,8 @@ enum Command {
         gedcom: PathBuf,
         #[arg(long)]
         records: PathBuf,
+        #[arg(long, default_value = "./data/genealogy.sqlite3")]
+        database: PathBuf,
     },
 }
 
@@ -78,7 +80,11 @@ async fn main() -> Result<()> {
             database,
         } => cli_scan(&directory, &database),
         Command::Process { file } => cli_process(&file).await,
-        Command::Audit { gedcom, records } => cli_audit(&gedcom, &records),
+        Command::Audit {
+            gedcom,
+            records,
+            database,
+        } => cli_audit(&gedcom, &records, &database),
     }
 }
 
@@ -169,7 +175,8 @@ async fn serve() -> Result<()> {
 fn cli_scan(directory: &std::path::Path, database: &std::path::Path) -> Result<()> {
     let db = Database::open(database)?;
     let sidecars = SidecarConfig::load(&db)?;
-    let files = scanner::scan_and_hash(directory)?;
+    let exclusions = scanner::DirectoryExclusions::load(&db)?;
+    let files = scanner::scan_and_hash_with_exclusions(directory, &exclusions)?;
     let mut new_or_modified = 0usize;
     let mut unchanged = 0usize;
     let mut existing_transcripts = 0usize;
@@ -233,11 +240,17 @@ async fn cli_process(file: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-fn cli_audit(gedcom_path: &std::path::Path, records: &std::path::Path) -> Result<()> {
+fn cli_audit(
+    gedcom_path: &std::path::Path,
+    records: &std::path::Path,
+    database: &std::path::Path,
+) -> Result<()> {
+    let db = Database::open(database)?;
+    let exclusions = scanner::DirectoryExclusions::load(&db)?;
     let contents = std::fs::read_to_string(gedcom_path)
         .with_context(|| format!("reading GEDCOM {}", gedcom_path.display()))?;
     let gedcom = gedcom::parser::parse(&contents);
-    let anomalies = gedcom::rules::check(&gedcom, records)?;
+    let anomalies = gedcom::rules::check_with_exclusions(&gedcom, records, &exclusions)?;
     println!("{}", serde_json::to_string_pretty(&anomalies)?);
     Ok(())
 }
