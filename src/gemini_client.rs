@@ -41,6 +41,23 @@ struct ModelQuotaExceeded {
 #[derive(Debug)]
 struct NoCandidateText;
 
+#[derive(Debug)]
+struct PdfRequiresChunks {
+    message: String,
+}
+
+impl fmt::Display for PdfRequiresChunks {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "Gemini rejected the PDF as too large: {}",
+            self.message
+        )
+    }
+}
+
+impl Error for PdfRequiresChunks {}
+
 impl fmt::Display for NoCandidateText {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("Gemini response contained no candidate text")
@@ -283,6 +300,12 @@ impl GeminiClient {
                     }
                     .into());
                 }
+                if has_pdf_attachment(parts) && is_pdf_size_rejection(status, message) {
+                    return Err(PdfRequiresChunks {
+                        message: message.to_owned(),
+                    }
+                    .into());
+                }
                 if Self::is_transient_api_status(status) && attempt + 1 < MAX_API_ATTEMPTS {
                     tracing::warn!(
                         model,
@@ -300,6 +323,13 @@ impl GeminiClient {
                 .and_then(Value::as_str)
                 == Some("MAX_TOKENS")
             {
+                if has_pdf_attachment(parts) {
+                    return Err(PdfRequiresChunks {
+                        message: "the PDF response exceeded the model output token limit"
+                            .to_owned(),
+                    }
+                    .into());
+                }
                 anyhow::bail!("Gemini reached its output token limit; refusing to save a potentially truncated response");
             }
             let texts: Vec<&str> = body
@@ -443,6 +473,39 @@ impl GeminiClient {
     }
 }
 
+fn has_pdf_attachment(parts: &[Value]) -> bool {
+    parts.iter().any(|part| {
+        part.pointer("/inlineData/mimeType").and_then(Value::as_str) == Some("application/pdf")
+    })
+}
+
+fn is_pdf_size_rejection(status: StatusCode, message: &str) -> bool {
+    if status == StatusCode::PAYLOAD_TOO_LARGE {
+        return true;
+    }
+    if status != StatusCode::BAD_REQUEST {
+        return false;
+    }
+    let message = message.to_ascii_lowercase();
+    [
+        "too large",
+        "size limit",
+        "payload size",
+        "request size exceeds",
+        "input size",
+        "input token",
+        "too many tokens",
+        "token limit",
+        "maximum number of tokens",
+    ]
+    .iter()
+    .any(|phrase| message.contains(phrase))
+}
+
+pub fn is_pdf_size_rejection_error(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<PdfRequiresChunks>().is_some()
+}
+
 pub fn is_no_candidate_text(error: &anyhow::Error) -> bool {
     error.downcast_ref::<NoCandidateText>().is_some()
 }
@@ -535,7 +598,7 @@ fn render_transcript(metadata: &serde_yaml::Mapping, body: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_text_flash_model, normalize_transcript, GeminiClient};
+    use super::{is_pdf_size_rejection, is_text_flash_model, normalize_transcript, GeminiClient};
     use reqwest::StatusCode;
 
     #[test]
@@ -563,6 +626,26 @@ mod tests {
         ));
         assert!(!GeminiClient::is_transient_api_status(
             StatusCode::UNAUTHORIZED
+        ));
+    }
+
+    #[test]
+    fn pdf_size_rejections_are_limited_to_payload_and_token_limits() {
+        assert!(is_pdf_size_rejection(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "request rejected"
+        ));
+        assert!(is_pdf_size_rejection(
+            StatusCode::BAD_REQUEST,
+            "Input token count exceeds the limit"
+        ));
+        assert!(!is_pdf_size_rejection(
+            StatusCode::BAD_REQUEST,
+            "Invalid PDF document"
+        ));
+        assert!(!is_pdf_size_rejection(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "temporary server failure"
         ));
     }
 

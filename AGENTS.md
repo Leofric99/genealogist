@@ -12,6 +12,8 @@
   all master and page-level transcript paths through `src/sidecar.rs`. Settings
   are persisted in SQLite; scanner delta checks, direct/CLI processing, GEDCOM
   audits, and Life Story discovery must remain compatible with either layout.
+  When a user changes sidecar layout, relocate only transcript Markdown files;
+  never move source documents, and refuse collisions rather than overwrite.
   Do not overwrite a transcript for an unchanged file when it already exists
   at the configured path.
 - Keep the default transcription prompt format-agnostic. Its table guidance
@@ -73,9 +75,11 @@
   `LIFE_STORY_REVIEW_PROMPT` in `src/web/handlers.rs`. Keep the document-type
   guidance format-agnostic and preserve explicit surname inheritance rules for
   grouped indexes and tables.
-- For long PDFs, a Gemini response with no candidate text is an empty-page
-  marker, not a page-processing error. Continue processing and consolidate
-  available page text; only fail the PDF when no page produced any text.
+- Always try sending the complete PDF to Gemini first, regardless of page
+  count. Only size/input/output-token rejection should trigger a fallback to
+  groups of ten pages; transcribe each group and consolidate all completed
+  group text. A group with no candidate text is an empty-group marker, not a
+  processing error; only fail the PDF when no group produced text.
 - Directory scans use a cancellation token. Keep cancellation checks in
   filesystem traversal/hashing and make processing futures cancellable.
 - PDF operations use `lopdf`; always clean temporary page files with RAII.

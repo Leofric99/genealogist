@@ -185,7 +185,10 @@ fn cli_scan(directory: &std::path::Path, database: &std::path::Path) -> Result<(
         } else {
             if indexed_hash.as_deref() == Some(&file.sha256) && status.as_deref() == Some("error") {
                 new_or_modified += 1;
-            } else if indexed_hash.is_none() && transcript.is_file() {
+            } else if transcript.is_file()
+                && status.as_deref() != Some("error")
+                && stored_transcript.as_deref() != Some(transcript_string.as_ref())
+            {
                 db.save_file(
                     &path,
                     &file.sha256,

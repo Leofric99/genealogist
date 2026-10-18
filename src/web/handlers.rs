@@ -309,17 +309,28 @@ pub async fn save_settings(
     } else {
         None
     };
+    if let Some(sidecars) = sidecars {
+        let previous = SidecarConfig::load(&state.db)?;
+        if previous != sidecars {
+            let records_root = state.config.records_dir.clone();
+            let old_layout = previous.clone();
+            let new_layout = sidecars.clone();
+            let moved = tokio::task::spawn_blocking(move || {
+                crate::sidecar::relocate_existing_sidecars(&records_root, &old_layout, &new_layout)
+            })
+            .await??;
+            tracing::info!(moved, "relocated existing transcript sidecars");
+        }
+        state
+            .db
+            .set_sidecar_settings(sidecars.mode(), sidecars.folder())?;
+    }
     if let Some(key) = request.api_key.filter(|key| !key.trim().is_empty()) {
         let encrypted = state.cipher.encrypt(key.trim())?;
         state.db.set_setting("gemini_api_key", &encrypted)?;
     }
     if let Some(prompt) = request.system_prompt {
         state.db.set_setting("system_prompt", prompt.trim())?;
-    }
-    if let Some(sidecars) = sidecars {
-        state
-            .db
-            .set_sidecar_settings(sidecars.mode(), sidecars.folder())?;
     }
     Ok(Json(json!({ "saved": true })))
 }

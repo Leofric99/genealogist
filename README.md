@@ -101,13 +101,14 @@ PUID=$(id -u) PGID=$(id -g) docker compose up --build
    and test your Gemini API key, choose the transcription prompt, and select
    where transcripts should be stored. In subfolder mode, choose a simple
    folder name; that folder is created inside each source document's directory.
-   Changing this choice later does not move existing transcripts and may cause
-   files to be transcribed again at the new location.
+   Changing this choice later moves existing transcription files (including
+   split-PDF page transcripts) to the selected layout without moving originals.
 3. **Scan the records.** From the Dashboard, select **Scan records directory**
    and monitor the saved progress. You can leave the page and reconnect later;
    completed transcripts remain on disk. Use **Stop scan** to cancel remaining
-   work. Images may be filtered as non-documents; PDFs are processed directly,
-   with long PDFs split into pages and consolidated afterward.
+   work. Images may be filtered as non-documents. PDFs are first sent to Gemini
+   whole regardless of page count; only a size/input/output-token rejection
+   triggers a retry as groups of ten pages followed by consolidation.
 4. **Review the transcripts.** Open the generated Markdown files and correct
    uncertain names, dates, relationships, or table alignment against the scans.
    Keep the YAML frontmatter intact where possible because audits and source
@@ -131,25 +132,30 @@ PUID=$(id -u) PGID=$(id -g) docker compose up --build
 ## Notes
 
 - Image files are heuristically filtered, then checked by Gemini Flash-Lite;
-  PDFs bypass photo filtering. PDFs over ten pages are transcribed page by page
-  before a consolidation pass.
+  PDFs bypass photo filtering. PDFs are first transcribed as a single document;
+  size-related rejections trigger a fallback to ten-page chunks and a final
+  consolidation pass.
 - Transcripts and page-level transcripts are written beside each source file
   or in the configured sidecar subfolder.
 - Settings can keep sidecars beside each source or put them in a named
   subfolder inside each source's directory. The setting is saved in SQLite;
   scanning, direct processing, CLI delta checks, PDF page transcripts, GEDCOM
   audits, and Life Story source discovery all use or recursively discover the
-  configured sidecars. Changing the location does not move old transcripts;
-  files are recognized as complete at the new location only when their
-  transcript is present there.
-- For long PDFs, pages for which Gemini returns no text are retained as
-  non-error placeholders and the other pages continue through consolidation.
-  The PDF is an error only when no page produced transcription text. Standalone
-  images with no Gemini text response are indexed as empty rather than failed.
+  configured sidecars. Changing the location moves existing master and
+  per-page Markdown transcripts between the source directory and configured
+  subfolder; original documents are never moved. A move is refused if it would
+  overwrite an existing transcript.
+- For PDF chunk fallback, a chunk for which Gemini returns no text is retained
+  as a non-error placeholder and the other chunks continue through
+  consolidation. The PDF is an error only when no chunk produced transcription
+  text. Standalone images with no Gemini text response are indexed as empty
+  rather than failed.
 - The default transcription prompt preserves table columns, row alignment,
   empty cells, and source order without assuming a particular document type.
-  Existing saved copies of the previous built-in prompt are upgraded on
-  startup; custom prompts are left unchanged.
+  It explicitly separates multi-level column headings and printed form
+  instructions from table data, and asks for one row per person on census-style
+  schedules. Existing exact copies of previous built-in prompts are upgraded
+  on startup; custom prompts are left unchanged.
 - API keys are encrypted in SQLite using a local encryption key. Back up the
   `.encryption-key` file along with the database; alternatively supply a stable
   64-hex-character `GOS_MASTER_KEY`.
@@ -174,6 +180,11 @@ PUID=$(id -u) PGID=$(id -g) docker compose up --build
   indexed files** on the dashboard to reset the SQLite file index; this preserves
   source documents and all transcripts. Existing transcripts will still be
   detected and skipped during a subsequent scan.
+- A `filtered` image may have been rejected by the native visual heuristic or
+  classified as a photo by Gemini Flash-Lite. The dashboard's Details field
+  now explains which stage filtered it and, for native filtering, shows the
+  measured scores. Previously filtered images without a saved reason are
+  checked again on the next scan.
 - Geographical anomaly checks are conservative string/date heuristics, not
   geocoding. Review flagged items manually.
 - Life story source selection can tolerate OCR name variants when other evidence

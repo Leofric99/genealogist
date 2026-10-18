@@ -136,12 +136,14 @@ async fn process_one(
     let source = path.to_string_lossy().into_owned();
     let previous_hash = state.db.file_hash(&source)?;
     let previous_status = state.db.file_status(&source)?;
+    let previous_error = state.db.file_error(&source)?;
     let transcript_path = sidecars.transcript_path(path);
     let transcript_path_string = transcript_path.to_string_lossy();
     let previous_transcript_path = state.db.file_transcript_path(&source)?;
     let unchanged_and_complete = previous_hash.as_deref() == Some(&file.sha256)
         && match previous_status.as_deref() {
-            Some("filtered") | Some("empty") => !transcript_path.is_file(),
+            Some("filtered") => previous_error.is_some() && !transcript_path.is_file(),
+            Some("empty") => !transcript_path.is_file(),
             Some("transcribed") | Some("external_transcript") => {
                 previous_transcript_path.as_deref() == Some(transcript_path_string.as_ref())
                     && transcript_path.is_file()
@@ -191,13 +193,18 @@ async fn process_one(
             }
         };
         if !score.likely_document {
+            let reason = format!(
+                "Native image filter classified as non-document (edge density {:.4}, contrast variance {:.4}, bimodal fraction {:.4}, horizontal line rows {}). This may be a false negative for low-contrast or unusual scans.",
+                score.edge_density,
+                score.normalized_variance,
+                score.bimodal_fraction,
+                score.horizontal_line_rows
+            );
             state
                 .db
-                .save_file(&source, &file.sha256, "filtered", None, None)?;
-            info!(path = %path.display(), edge_density = score.edge_density, "native filter skipped likely non-document image");
-            return Ok(ProcessResult::Skipped(
-                "Skipped by native image pre-filter".to_owned(),
-            ));
+                .save_file(&source, &file.sha256, "filtered", None, Some(&reason))?;
+            info!(path = %path.display(), edge_density = score.edge_density, normalized_variance = score.normalized_variance, bimodal_fraction = score.bimodal_fraction, horizontal_line_rows = score.horizontal_line_rows, "native filter skipped likely non-document image");
+            return Ok(ProcessResult::Skipped(reason));
         }
     }
 
@@ -219,12 +226,13 @@ async fn process_one(
             Err(error) => return Err(error),
         };
         if !is_document {
+            let reason =
+                "Gemini Flash-Lite classified this image as a photo, so transcription was skipped."
+                    .to_owned();
             state
                 .db
-                .save_file(&source, &file.sha256, "filtered", None, None)?;
-            return Ok(ProcessResult::Skipped(
-                "Gemini classified image as a photo".to_owned(),
-            ));
+                .save_file(&source, &file.sha256, "filtered", None, Some(&reason))?;
+            return Ok(ProcessResult::Skipped(reason));
         }
         match state
             .gemini
@@ -261,61 +269,73 @@ async fn transcribe_pdf(
     sidecars: &SidecarConfig,
     cancellation: Option<&CancellationToken>,
 ) -> Result<String> {
-    let count_path = path.to_path_buf();
-    let pages = tokio::task::spawn_blocking(move || crate::pdf::page_count(&count_path)).await??;
     if cancellation.is_some_and(CancellationToken::is_cancelled) {
         anyhow::bail!("scan cancelled");
     }
-    if pages <= 10 {
-        return state.gemini.transcribe_file(path, key, prompt).await;
+    match state.gemini.transcribe_file(path, key, prompt).await {
+        Ok(transcript) => return Ok(transcript),
+        Err(error) if crate::gemini_client::is_pdf_size_rejection_error(&error) => {
+            warn!(
+                path = %path.display(),
+                %error,
+                "Gemini rejected the full PDF; retrying in groups of ten pages"
+            );
+        }
+        Err(error) => return Err(error),
+    }
+
+    let count_path = path.to_path_buf();
+    let pages = tokio::task::spawn_blocking(move || crate::pdf::page_count(&count_path)).await??;
+    if pages == 0 {
+        anyhow::bail!("PDF contains no pages");
     }
     let tempdir = tempfile::tempdir().context("creating temporary PDF page directory")?;
     let source = path.to_path_buf();
     let page_dir = tempdir.path().to_path_buf();
     let split_cancellation = cancellation.cloned();
-    let page_paths = tokio::task::spawn_blocking(move || match split_cancellation {
-        Some(cancellation) => {
-            crate::pdf::split_to_single_pages_cancellable(&source, &page_dir, &cancellation)
-        }
-        None => crate::pdf::split_to_single_pages(&source, &page_dir).map(Some),
+    let page_paths = tokio::task::spawn_blocking(move || {
+        let cancellation = split_cancellation.unwrap_or_else(CancellationToken::new);
+        crate::pdf::split_into_page_groups_cancellable(&source, &page_dir, 10, &cancellation)
     })
     .await??
     .context("PDF page splitting was cancelled")?;
     let mut transcripts = Vec::with_capacity(page_paths.len());
-    let mut has_page_output = false;
+    let mut has_group_output = false;
     for (index, page_path) in page_paths.iter().enumerate() {
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
             anyhow::bail!("scan cancelled");
         }
         let transcript = match state.gemini.transcribe_file(page_path, key, prompt).await {
             Ok(transcript) if !transcript.trim().is_empty() => {
-                has_page_output = true;
+                has_group_output = true;
                 transcript
             }
             Ok(_) => {
                 info!(
                     pdf = %path.display(),
-                    page = index + 1,
-                    "Gemini returned no transcription text for PDF page"
+                    group = index + 1,
+                    "Gemini returned no transcription text for PDF page group"
                 );
                 no_page_text_marker()
             }
             Err(error) if crate::gemini_client::is_no_candidate_text(&error) => {
                 info!(
                     pdf = %path.display(),
-                    page = index + 1,
-                    "Gemini returned no transcription text for PDF page"
+                    group = index + 1,
+                    "Gemini returned no transcription text for PDF page group"
                 );
                 no_page_text_marker()
             }
             Err(error) => return Err(error),
         };
-        let page_target = sidecars.page_transcript_path(path, index + 1);
-        write_sidecar(&page_target, &transcript).await?;
+        let first_page = index * 10 + 1;
+        let last_page = (first_page + 9).min(pages);
+        let group_target = sidecars.page_group_transcript_path(path, first_page, last_page);
+        write_sidecar(&group_target, &transcript).await?;
         transcripts.push(transcript);
     }
-    if !has_page_output {
-        anyhow::bail!("Gemini returned no transcription text for any page of this PDF");
+    if !has_group_output {
+        anyhow::bail!("Gemini returned no transcription text for any PDF page group");
     }
     state.gemini.consolidate(&transcripts, key, prompt).await
 }
