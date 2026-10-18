@@ -138,7 +138,6 @@ async fn process_one(
     let previous_status = state.db.file_status(&source)?;
     let previous_error = state.db.file_error(&source)?;
     let transcript_path = sidecars.transcript_path(path);
-    let metadata_path = sidecars.metadata_path(path);
     let transcript_path_string = transcript_path.to_string_lossy().into_owned();
     let previous_transcript_path = state.db.file_transcript_path(&source)?;
     let source_unchanged = previous_hash.as_deref() == Some(&file.sha256);
@@ -152,40 +151,22 @@ async fn process_one(
         && transcript_path.is_file();
 
     if transcript_is_current {
-        if metadata_is_current(&transcript_path, &file.sha256).await? {
-            if previous_error.is_some() {
-                state.db.save_file(
-                    &source,
-                    &file.sha256,
-                    if previous_status.as_deref() == Some("external_transcript") {
-                        "external_transcript"
-                    } else {
-                        "transcribed"
-                    },
-                    Some(&transcript_path_string),
-                    None,
-                )?;
-            }
-            return Ok(ProcessResult::Skipped(
-                "Unchanged file already handled".to_owned(),
-            ));
+        if previous_error.is_some() || previous_status.as_deref() == Some("metadata_error") {
+            state.db.save_file(
+                &source,
+                &file.sha256,
+                if previous_status.as_deref() == Some("external_transcript") {
+                    "external_transcript"
+                } else {
+                    "transcribed"
+                },
+                Some(&transcript_path_string),
+                None,
+            )?;
         }
-        persist_metadata_or_report(
-            state,
-            path,
-            &source,
-            &file.sha256,
-            &transcript_path,
-            &metadata_path,
-            &transcript_path_string,
-            if previous_status.as_deref() == Some("external_transcript") {
-                "external_transcript"
-            } else {
-                "transcribed"
-            },
-        )
-        .await?;
-        return Ok(ProcessResult::Processed);
+        return Ok(ProcessResult::Skipped(
+            "Unchanged file already handled".to_owned(),
+        ));
     }
 
     if source_unchanged
@@ -212,23 +193,9 @@ async fn process_one(
             Some(&transcript_path_string),
             None,
         )?;
-        if metadata_is_current(&transcript_path, &file.sha256).await? {
-            return Ok(ProcessResult::Skipped(
-                "Matching transcript and JSON metadata already exist".to_owned(),
-            ));
-        }
-        persist_metadata_or_report(
-            state,
-            path,
-            &source,
-            &file.sha256,
-            &transcript_path,
-            &metadata_path,
-            &transcript_path_string,
-            "external_transcript",
-        )
-        .await?;
-        return Ok(ProcessResult::Processed);
+        return Ok(ProcessResult::Skipped(
+            "Matching transcript already exists".to_owned(),
+        ));
     }
     if !is_pdf {
         let score = match image_score {
@@ -295,7 +262,7 @@ async fn process_one(
         {
             Ok(transcript) => transcript,
             Err(error) if crate::gemini_client::is_non_document(&error) => {
-                let reason = "Gemini transcription safeguard classified this image as a non-document; no transcript or JSON was created.".to_owned();
+                let reason = "Gemini transcription safeguard classified this image as a non-document; no transcript was created.".to_owned();
                 state
                     .db
                     .save_file(&source, &file.sha256, "filtered", None, Some(&reason))?;
@@ -319,117 +286,7 @@ async fn process_one(
         Some(&transcript_path_string),
         None,
     )?;
-    persist_metadata_or_report(
-        state,
-        path,
-        &source,
-        &file.sha256,
-        &transcript_path,
-        &metadata_path,
-        &transcript_path_string,
-        "transcribed",
-    )
-    .await?;
     Ok(ProcessResult::Processed)
-}
-
-async fn metadata_is_current(transcript_path: &Path, source_sha256: &str) -> Result<bool> {
-    let transcript_path = transcript_path.to_path_buf();
-    let source_sha256 = source_sha256.to_owned();
-    let result = tokio::task::spawn_blocking(move || {
-        crate::transcript_data::read_for_transcript(&transcript_path).map(|metadata| {
-            metadata.is_some_and(|metadata| {
-                crate::transcript_data::is_current(&metadata, &source_sha256)
-            })
-        })
-    })
-    .await?;
-    match result {
-        Ok(is_current) => Ok(is_current),
-        Err(error) => {
-            warn!(%error, "transcript JSON is missing, stale, or invalid; it will be regenerated");
-            Ok(false)
-        }
-    }
-}
-
-async fn persist_metadata_or_report(
-    state: &AppState,
-    source_path: &Path,
-    source: &str,
-    source_sha256: &str,
-    transcript_path: &Path,
-    metadata_path: &Path,
-    transcript_path_string: &str,
-    file_status: &str,
-) -> Result<()> {
-    let result = async {
-        let key = api_key(state)?;
-        let transcript = tokio::fs::read_to_string(transcript_path)
-            .await
-            .with_context(|| format!("reading transcript {}", transcript_path.display()))?;
-        let body = crate::transcript_data::transcription_body(&transcript);
-        let payload = state.gemini.extract_transcript_metadata(body, &key).await?;
-        let metadata = crate::transcript_data::build_metadata(
-            payload,
-            source_path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or("document"),
-            source_sha256,
-            &transcript,
-        )?;
-        let serialized = serde_json::to_string_pretty(&metadata)
-            .context("serializing structured transcript metadata")?;
-        write_metadata_sidecar(metadata_path, &serialized, source_path).await?;
-        Ok::<_, anyhow::Error>(())
-    }
-    .await;
-
-    match result {
-        Ok(()) => state.db.save_file(
-            source,
-            source_sha256,
-            file_status,
-            Some(transcript_path_string),
-            None,
-        ),
-        Err(error) => {
-            let message = format!("Transcript saved; JSON extraction is pending: {error:#}");
-            state.db.save_file(
-                source,
-                source_sha256,
-                "metadata_error",
-                Some(transcript_path_string),
-                Some(&message),
-            )?;
-            error!(path = %source_path.display(), %message, "transcript JSON extraction failed");
-            Ok(())
-        }
-    }
-}
-
-async fn write_metadata_sidecar(path: &Path, contents: &str, source_path: &Path) -> Result<()> {
-    if tokio::fs::try_exists(path).await? {
-        let existing = tokio::fs::read_to_string(path)
-            .await
-            .with_context(|| format!("reading existing JSON sidecar {}", path.display()))?;
-        let metadata: crate::transcript_data::TranscriptMetadata = serde_json::from_str(&existing)
-            .with_context(|| {
-                format!(
-                    "refusing to overwrite non-GeneSleuth JSON sidecar {}",
-                    path.display()
-                )
-            })?;
-        let source_filename = source_path.file_name().and_then(|name| name.to_str());
-        if source_filename != Some(metadata.source_filename.as_str()) {
-            anyhow::bail!(
-                "refusing to overwrite JSON sidecar {} because it belongs to a different source file",
-                path.display()
-            );
-        }
-    }
-    write_sidecar(path, contents).await
 }
 
 fn save_empty_image(state: &AppState, source: &str, sha256: &str) -> Result<()> {
@@ -608,20 +465,7 @@ pub async fn direct_process(state: &AppState, path: &Path) -> Result<String> {
     let result = match process_one(state, &one, &sidecars, image_score, None).await? {
         ProcessResult::Processed => {
             let transcript = sidecars.transcript_path(path);
-            let metadata = sidecars.metadata_path(path);
-            let source = path.to_string_lossy();
-            if let Some(error) = state.db.file_error(&source)? {
-                format!(
-                    "Transcript: {}\nJSON metadata pending: {error}",
-                    transcript.display()
-                )
-            } else {
-                format!(
-                    "Transcript: {}\nJSON metadata: {}",
-                    transcript.display(),
-                    metadata.display()
-                )
-            }
+            format!("Transcript: {}", transcript.display())
         }
         ProcessResult::Skipped(reason) => format!("Skipped: {reason}"),
     };

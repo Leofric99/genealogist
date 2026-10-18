@@ -8,40 +8,34 @@
   the current queue job. Keep blocking rusqlite and filesystem work off async
   request paths where it may become long-running.
 - Transcripts are body-only Markdown, stored beside the source image/PDF or in
-  the user's configured sidecar subfolder. A separate JSON companion stores
-  extracted person mentions and evidence-backed facts. Resolve all master and
-  page-level transcript paths through `src/sidecar.rs`. Settings are persisted
-  in SQLite; scanner delta checks, direct/CLI processing, GEDCOM audits, and
-  Life Story discovery must remain compatible with either layout. When a user
-  changes sidecar layout, relocate only transcript Markdown files; never move
-  source documents, and refuse collisions rather than overwrite. Missing JSON
-  companions are regenerated from the transcript on the next scan. Do not
-  overwrite a transcript for an unchanged file when it already exists at the
-  configured path.
+  the user's configured sidecar subfolder. Markdown is the only generated
+  per-document sidecar: do not add frontmatter or JSON extraction. Resolve all
+  master and page-level transcript paths through `src/sidecar.rs`. Settings
+  are persisted in SQLite; scanner delta checks, direct/CLI processing, GEDCOM
+  audits, and Life Story discovery must remain compatible with either layout.
+  When a user changes sidecar layout, relocate only transcript Markdown files;
+  never move source documents, and refuse collisions rather than overwrite.
+  Do not overwrite a transcript for an unchanged file when it already exists
+  at the configured path. Legacy JSON/YAML sidecars are ignored and left
+  untouched.
 - Keep the default transcription prompt format-agnostic. Its table guidance
   should preserve source row/column relationships, require consistent cell
   counts, and use compact Markdown separators rather than content-width padding.
   Keep headings/instructions separate from table values; preserve ditto marks
-  literally in Markdown and leave their expansion to structured extraction.
-  JSON extraction must resolve only clear same-column ditto values within one
-  table, keep the original marker in its evidence quote, and record the result
-  as inferred. Keep side-by-side index blocks explicitly separated.
+  literally in Markdown. Keep side-by-side index blocks explicitly separated.
 - When changing the built-in prompt, migrate only an exact match of the prior
   built-in text so saved custom prompts remain untouched.
-- Run structured extraction as separate Gemini calls after transcription,
-  using bounded Markdown chunks. Keep source labels and values,
-  require exact transcript evidence for each fact, and leave ambiguous person
-  matches unresolved. Split Markdown tables into bounded row batches, require
-  explicit row accounting and 1-based source row/column mappings, and reject a
-  batch unless every populated cell is represented by a person name or fact.
-  Preserve relationship direction for subjects and named relatives. Schema
-  upgrades must make old companions
-  eligible for metadata-only regeneration without retranscribing unchanged
-  source files. Existing audit and Life Story consumers must read JSON
-  companions while retaining compatibility with legacy YAML-frontmatter files.
+- Life Story discovery lives in `src/web/story_sources.rs`; match source
+  transcripts against GEDCOM people using document text, paths, dates, places,
+  and related names. Persist matches in SQLite as suggested, confirmed, or
+  rejected transcript-person links, keyed by GEDCOM identity, relative path,
+  and transcript hash. A transcript content change must reset an old review
+  decision to suggested. Only confirmed links are trusted as user-reviewed
+  selections, but all generated biography claims still require transcript
+  citations and validation by `src/web/story_format.rs`.
 - Keep the image-only `GENESLEUTH_NON_DOCUMENT` response invariant appended to
   custom prompts. Handle it as a permanent `filtered` result before writing a
-  transcript or attempting JSON extraction; PDFs must never use this sentinel.
+  transcript; PDFs must never use this sentinel.
 - Life story source matching lives in `src/web/story_sources.rs`; keep fuzzy
   name matches dependent on independent GEDCOM/transcript/path corroboration.
   `src/web/story_format.rs` validates per-section confidence and transcript

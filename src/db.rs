@@ -16,6 +16,8 @@ const PRE_METADATA_PROMPT_SHA256: &str =
     "798f051cfd905879abf27cd6df18c2baf817f25e6ef21c4616afe3b155132674";
 const PRE_DITTO_PROMPT_SHA256: &str =
     "729d982d4e4490322125dcdddc588c36f3d1d5ebd8025c36d66608dbc689993e";
+const PRE_TRANSCRIPT_ONLY_PROMPT_SHA256: &str =
+    "486ec5bab3a73546704cb88fe3f0072bd00d2109b89085ad2af5171f239a898a";
 
 pub struct Database {
     connection: Mutex<Connection>,
@@ -36,6 +38,18 @@ pub struct FileStatus {
     pub path: String,
     pub status: String,
     pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct TranscriptPersonLink {
+    pub person_key: String,
+    pub gedcom_xref: String,
+    pub person_name: String,
+    pub transcript_path: String,
+    pub transcript_sha256: String,
+    pub status: String,
+    pub confidence: f64,
+    pub evidence_json: String,
 }
 
 impl Database {
@@ -60,6 +74,18 @@ impl Database {
                  transcript_path TEXT,
                  error TEXT,
                  updated_at INTEGER NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS transcript_person_links (
+                 person_key TEXT NOT NULL,
+                 gedcom_xref TEXT NOT NULL,
+                 person_name TEXT NOT NULL,
+                 transcript_path TEXT NOT NULL,
+                 transcript_sha256 TEXT NOT NULL,
+                 status TEXT NOT NULL CHECK (status IN ('suggested', 'confirmed', 'rejected')),
+                 confidence REAL NOT NULL CHECK (confidence >= 0 AND confidence <= 1),
+                 evidence_json TEXT NOT NULL,
+                 updated_at INTEGER NOT NULL,
+                 PRIMARY KEY (person_key, transcript_path)
              );
              CREATE TABLE IF NOT EXISTS job (
                  id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -92,7 +118,12 @@ impl Database {
         // Fingerprints of prior built-in prompts; custom text is not migrated.
         if stored_prompt.as_deref().is_some_and(|prompt| {
             let fingerprint = hex::encode(Sha256::digest(prompt.as_bytes()));
-            fingerprint == PRE_METADATA_PROMPT_SHA256 || fingerprint == PRE_DITTO_PROMPT_SHA256
+            [
+                PRE_METADATA_PROMPT_SHA256,
+                PRE_DITTO_PROMPT_SHA256,
+                PRE_TRANSCRIPT_ONLY_PROMPT_SHA256,
+            ]
+            .contains(&fingerprint.as_str())
         }) {
             connection.execute(
                 "UPDATE settings SET value = ?1 WHERE key = 'system_prompt'",
@@ -126,6 +157,94 @@ impl Database {
             params![key, value],
         )?;
         Ok(())
+    }
+
+    pub fn suggest_transcript_person_link(
+        &self,
+        person_key: &str,
+        gedcom_xref: &str,
+        person_name: &str,
+        transcript_path: &str,
+        transcript_sha256: &str,
+        confidence: f64,
+        evidence_json: &str,
+    ) -> Result<()> {
+        if !(0.0..=1.0).contains(&confidence) {
+            anyhow::bail!("transcript-person link confidence must be between 0 and 1");
+        }
+        let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
+        self.connection()?.execute(
+            "INSERT INTO transcript_person_links
+                (person_key, gedcom_xref, person_name, transcript_path, transcript_sha256,
+                 status, confidence, evidence_json, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'suggested', ?6, ?7, ?8)
+             ON CONFLICT(person_key, transcript_path) DO UPDATE SET
+                gedcom_xref=excluded.gedcom_xref,
+                person_name=excluded.person_name,
+                status=CASE
+                    WHEN transcript_person_links.transcript_sha256=excluded.transcript_sha256
+                    THEN transcript_person_links.status
+                    ELSE 'suggested'
+                END,
+                transcript_sha256=excluded.transcript_sha256,
+                confidence=excluded.confidence,
+                evidence_json=excluded.evidence_json,
+                updated_at=excluded.updated_at",
+            params![
+                person_key,
+                gedcom_xref,
+                person_name,
+                transcript_path,
+                transcript_sha256,
+                confidence,
+                evidence_json,
+                now
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn transcript_person_links(&self, person_key: &str) -> Result<Vec<TranscriptPersonLink>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT person_key, gedcom_xref, person_name, transcript_path, transcript_sha256,
+                    status, confidence, evidence_json
+             FROM transcript_person_links
+             WHERE person_key=?1
+             ORDER BY status='confirmed' DESC, confidence DESC, transcript_path",
+        )?;
+        let rows = statement.query_map([person_key], |row| {
+            Ok(TranscriptPersonLink {
+                person_key: row.get(0)?,
+                gedcom_xref: row.get(1)?,
+                person_name: row.get(2)?,
+                transcript_path: row.get(3)?,
+                transcript_sha256: row.get(4)?,
+                status: row.get(5)?,
+                confidence: row.get(6)?,
+                evidence_json: row.get(7)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn set_transcript_person_link_status(
+        &self,
+        person_key: &str,
+        transcript_path: &str,
+        transcript_sha256: &str,
+        status: &str,
+    ) -> Result<bool> {
+        if !matches!(status, "confirmed" | "rejected") {
+            anyhow::bail!("invalid transcript-person link status");
+        }
+        let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
+        let updated = self.connection()?.execute(
+            "UPDATE transcript_person_links SET status=?1, updated_at=?2
+             WHERE person_key=?3 AND transcript_path=?4 AND transcript_sha256=?5",
+            params![status, now, person_key, transcript_path, transcript_sha256],
+        )?;
+        Ok(updated == 1)
     }
 
     pub fn set_sidecar_settings(&self, mode: &str, folder: &str) -> Result<()> {
@@ -401,6 +520,66 @@ mod tests {
             database.setting("system_prompt").expect("read prompt"),
             Some(DEFAULT_SYSTEM_PROMPT.to_owned())
         );
+    }
+
+    #[test]
+    fn transcript_person_links_keep_review_state_until_transcript_changes() {
+        let directory = tempfile::tempdir().expect("temporary database directory");
+        let database =
+            Database::open(&directory.path().join("genealogy.sqlite3")).expect("open database");
+        database
+            .suggest_transcript_person_link(
+                "person-key",
+                "@I1@",
+                "Ada Example",
+                "records/birth.md",
+                &"a".repeat(64),
+                0.8,
+                r#"["exact name appears in transcript text"]"#,
+            )
+            .expect("save source suggestion");
+        assert_eq!(
+            database.transcript_person_links("person-key").unwrap()[0].status,
+            "suggested"
+        );
+        assert!(database
+            .set_transcript_person_link_status(
+                "person-key",
+                "records/birth.md",
+                &"a".repeat(64),
+                "confirmed"
+            )
+            .unwrap());
+        database
+            .suggest_transcript_person_link(
+                "person-key",
+                "@I1@",
+                "Ada Example",
+                "records/birth.md",
+                &"a".repeat(64),
+                0.9,
+                r#"["updated evidence"]"#,
+            )
+            .expect("refresh source suggestion");
+        assert_eq!(
+            database.transcript_person_links("person-key").unwrap()[0].status,
+            "confirmed"
+        );
+        database
+            .suggest_transcript_person_link(
+                "person-key",
+                "@I1@",
+                "Ada Example",
+                "records/birth.md",
+                &"b".repeat(64),
+                0.75,
+                r#"["transcript changed"]"#,
+            )
+            .expect("refresh changed transcript suggestion");
+        let links = database.transcript_person_links("person-key").unwrap();
+        let link = &links[0];
+        assert_eq!(link.status, "suggested");
+        assert_eq!(link.transcript_sha256, "b".repeat(64));
     }
 
     #[test]

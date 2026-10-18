@@ -20,7 +20,9 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::{
+    collections::HashMap,
     fs,
     path::{Path, PathBuf},
     sync::Arc,
@@ -69,6 +71,13 @@ pub struct TestKeyRequest {
 #[derive(Deserialize)]
 pub struct StoryRequest {
     pub destination: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct StorySourceLinkRequest {
+    pub transcript_path: String,
+    pub transcript_sha256: String,
+    pub action: String,
 }
 
 #[derive(Deserialize)]
@@ -419,15 +428,12 @@ pub async fn run_audit(State(state): State<Arc<AppState>>) -> Result<Json<Value>
         })?;
     let records = state.config.records_dir.clone();
     let report_path = state.config.output_dir.join("audit-report.md");
-    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+    let anomalies = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
         let gedcom_text = fs::read_to_string(&gedcom_path)?;
         let gedcom = parser::parse(&gedcom_text);
-        let anomalies = rules::check(&gedcom, &records)?;
-        let facts = collect_transcript_facts(&records)?;
-        Ok((anomalies, facts))
+        rules::check(&gedcom, &records)
     })
     .await??;
-    let (anomalies, facts) = result;
     let key = if state.db.setting("gemini_api_key")?.is_some()
         || state
             .config
@@ -441,9 +447,8 @@ pub async fn run_audit(State(state): State<Arc<AppState>>) -> Result<Json<Value>
     };
     let narrative = if let Some(key) = key {
         let prompt = format!(
-            "Write a human-readable genealogy research anomaly audit. Explain each finding, distinguish evidence from uncertainty, and suggest cautious corrections. Do not claim facts not present in the data.\n\nRule violations:\n{}\n\nStructured transcript JSON facts (legacy YAML frontmatter may appear for older transcripts):\n{}",
+            "Write a human-readable genealogy research anomaly audit. Explain each finding, distinguish evidence from uncertainty, and suggest cautious corrections. Do not claim facts not present in the data. Any transcript or path references in the rule findings are heuristic leads, not verified identity matches.\n\nRule violations:\n{}",
             serde_json::to_string_pretty(&anomalies)?,
-            facts,
         );
         state.gemini.text_prompt(&key, &prompt).await?
     } else {
@@ -484,6 +489,7 @@ pub async fn generate_story(
             )
         })?;
     let gedcom_text = tokio::fs::read_to_string(gedcom_path).await?;
+    let tree_key = hex::encode(Sha256::digest(gedcom_text.as_bytes()));
     let gedcom = parser::parse(&gedcom_text);
     let graph = crate::gedcom::graph::FamilyGraph::build(&gedcom);
     let person = graph.people.get(xref.as_str()).ok_or_else(|| {
@@ -493,38 +499,14 @@ pub async fn generate_story(
         )
     })?;
     let name = person.name.unwrap_or("Unknown individual");
-    let identity = PersonIdentity {
-        name: name.to_owned(),
-        birth_year: person
-            .birth
-            .as_ref()
-            .and_then(|event| event.date)
-            .and_then(parser::date_year),
-        birth_place: person
-            .birth
-            .as_ref()
-            .and_then(|event| event.place)
-            .map(str::to_owned),
-        event_years: person
-            .events
-            .iter()
-            .filter_map(|event| event.date.and_then(parser::date_year))
-            .collect(),
-        event_places: person
-            .events
-            .iter()
-            .filter_map(|event| event.place.map(str::to_owned))
-            .collect(),
-    };
+    let identity = person_identity(&xref, person, &graph, &tree_key);
     let records = state.config.records_dir.clone();
-    let sources = tokio::task::spawn_blocking(move || {
-        story_sources::collect_person_sources(&records, &identity)
-    })
-    .await??;
+    let mut sources = select_story_sources(&state, &records, &identity).await?;
+    sources.retain(|source| source.link_status == "confirmed");
     if sources.is_empty() {
         return Err(ApiError(
             StatusCode::BAD_REQUEST,
-            "No matching transcript metadata was found; transcribe relevant records before generating a cited biography".to_owned(),
+            "No confirmed transcript sources are available. Find and review transcript candidates, then confirm the sources to use.".to_owned(),
         ));
     }
     let facts = person_facts(person, &graph);
@@ -577,6 +559,9 @@ pub async fn generate_story(
             json!({
                 "path": source.relative_path,
                 "evidence": source.match_evidence,
+                "confidence": source.confidence,
+                "status": source.link_status,
+                "transcript_sha256": source.transcript_sha256,
             })
         })
         .collect::<Vec<_>>();
@@ -587,6 +572,280 @@ pub async fn generate_story(
     })))
 }
 
+pub async fn discover_story_sources(
+    State(state): State<Arc<AppState>>,
+    AxumPath(xref): AxumPath<String>,
+) -> Result<Json<Value>, ApiError> {
+    if xref.len() > 64 || !xref.starts_with('@') || !xref.ends_with('@') {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            "Invalid GEDCOM individual identifier".to_owned(),
+        ));
+    }
+    let gedcom_path = state
+        .db
+        .setting("gedcom_path")?
+        .map(PathBuf::from)
+        .filter(|path| path.is_file())
+        .ok_or_else(|| {
+            ApiError(
+                StatusCode::BAD_REQUEST,
+                "Upload a GEDCOM file before discovering transcript sources".to_owned(),
+            )
+        })?;
+    let gedcom_text = tokio::fs::read_to_string(gedcom_path).await?;
+    let tree_key = hex::encode(Sha256::digest(gedcom_text.as_bytes()));
+    let gedcom = parser::parse(&gedcom_text);
+    let graph = crate::gedcom::graph::FamilyGraph::build(&gedcom);
+    let person = graph.people.get(xref.as_str()).ok_or_else(|| {
+        ApiError(
+            StatusCode::NOT_FOUND,
+            "GEDCOM individual was not found".to_owned(),
+        )
+    })?;
+    let identity = person_identity(&xref, person, &graph, &tree_key);
+    let records = state.config.records_dir.clone();
+    let sources = select_story_sources(&state, &records, &identity).await?;
+    let matched_sources = sources
+        .iter()
+        .map(|source| {
+            json!({
+                "path": source.relative_path,
+                "evidence": source.match_evidence,
+                "confidence": source.confidence,
+                "status": source.link_status,
+                "transcript_sha256": source.transcript_sha256,
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(Json(json!({
+        "person_name": identity.name,
+        "matched_sources": matched_sources,
+    })))
+}
+
+pub async fn update_story_source_link(
+    State(state): State<Arc<AppState>>,
+    AxumPath(xref): AxumPath<String>,
+    Json(request): Json<StorySourceLinkRequest>,
+) -> Result<Json<Value>, ApiError> {
+    if xref.len() > 64 || !xref.starts_with('@') || !xref.ends_with('@') {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            "Invalid GEDCOM individual identifier".to_owned(),
+        ));
+    }
+    let status = match request.action.as_str() {
+        "confirm" => "confirmed",
+        "reject" => "rejected",
+        _ => {
+            return Err(ApiError(
+                StatusCode::BAD_REQUEST,
+                "Source action must be confirm or reject".to_owned(),
+            ))
+        }
+    };
+    let gedcom_path = state
+        .db
+        .setting("gedcom_path")?
+        .map(PathBuf::from)
+        .filter(|path| path.is_file())
+        .ok_or_else(|| {
+            ApiError(
+                StatusCode::BAD_REQUEST,
+                "Upload a GEDCOM file before mapping transcript sources".to_owned(),
+            )
+        })?;
+    let gedcom_text = tokio::fs::read_to_string(gedcom_path).await?;
+    let tree_key = hex::encode(Sha256::digest(gedcom_text.as_bytes()));
+    let gedcom = parser::parse(&gedcom_text);
+    let graph = crate::gedcom::graph::FamilyGraph::build(&gedcom);
+    let person = graph.people.get(xref.as_str()).ok_or_else(|| {
+        ApiError(
+            StatusCode::NOT_FOUND,
+            "GEDCOM individual was not found".to_owned(),
+        )
+    })?;
+    let identity = person_identity(&xref, person, &graph, &tree_key);
+    let records = state.config.records_dir.clone();
+    let relative_path = request.transcript_path.clone();
+    let transcript = tokio::task::spawn_blocking(move || {
+        story_sources::read_transcript(&records, &relative_path)
+    })
+    .await??
+    .ok_or_else(|| {
+        ApiError(
+            StatusCode::NOT_FOUND,
+            "Transcript no longer exists in the records directory".to_owned(),
+        )
+    })?;
+    if transcript.transcript_sha256 != request.transcript_sha256 {
+        return Err(ApiError(
+            StatusCode::CONFLICT,
+            "Transcript changed; discover sources again before mapping it".to_owned(),
+        ));
+    }
+    let person_key = identity.stable_key();
+    let existing_links = state.db.transcript_person_links(&person_key)?;
+    if !existing_links.iter().any(|link| {
+        link.transcript_path == transcript.relative_path
+            && link.transcript_sha256 == transcript.transcript_sha256
+    }) {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            "Only a discovered transcript candidate can be confirmed or rejected".to_owned(),
+        ));
+    }
+    if !state.db.set_transcript_person_link_status(
+        &person_key,
+        &transcript.relative_path,
+        &transcript.transcript_sha256,
+        status,
+    )? {
+        return Err(ApiError(
+            StatusCode::CONFLICT,
+            "Transcript-person mapping changed; retry the action".to_owned(),
+        ));
+    }
+    Ok(Json(json!({
+        "path": transcript.relative_path,
+        "status": status
+    })))
+}
+
+async fn select_story_sources(
+    state: &AppState,
+    records: &Path,
+    identity: &PersonIdentity,
+) -> Result<Vec<story_sources::StorySource>> {
+    let records_root = records.to_path_buf();
+    let person = identity.clone();
+    let discovered = tokio::task::spawn_blocking(move || {
+        story_sources::collect_person_sources(&records_root, &person)
+    })
+    .await??;
+    let person_key = identity.stable_key();
+    for source in &discovered {
+        let evidence = serde_json::to_string(&source.match_evidence)?;
+        state.db.suggest_transcript_person_link(
+            &person_key,
+            &identity.xref,
+            &identity.name,
+            &source.relative_path,
+            &source.transcript_sha256,
+            source.confidence,
+            &evidence,
+        )?;
+    }
+
+    let links = state.db.transcript_person_links(&person_key)?;
+    let mut selected = discovered
+        .into_iter()
+        .map(|source| (source.relative_path.clone(), source))
+        .collect::<HashMap<_, _>>();
+    let mut confirmed_to_load = Vec::new();
+    for link in &links {
+        if link.status == "confirmed" && !selected.contains_key(&link.transcript_path) {
+            confirmed_to_load.push(link.clone());
+        }
+        if let Some(source) = selected.get_mut(&link.transcript_path) {
+            if source.transcript_sha256 == link.transcript_sha256 {
+                apply_persisted_link(source, link)?;
+            }
+        }
+    }
+
+    if !confirmed_to_load.is_empty() {
+        let records_root = records.to_path_buf();
+        let loaded = tokio::task::spawn_blocking(move || {
+            confirmed_to_load
+                .into_iter()
+                .filter_map(|link| {
+                    let result =
+                        story_sources::read_transcript(&records_root, &link.transcript_path)
+                            .map(|source| source.map(|source| (link, source)));
+                    Some(result)
+                })
+                .collect::<Result<Vec<_>>>()
+        })
+        .await??;
+        for item in loaded {
+            if let Some((link, mut source)) = item {
+                if source.transcript_sha256 == link.transcript_sha256 {
+                    apply_persisted_link(&mut source, &link)?;
+                    selected.insert(source.relative_path.clone(), source);
+                }
+            }
+        }
+    }
+
+    let mut selected = selected.into_values().collect::<Vec<_>>();
+    selected.sort_by(|left, right| {
+        right
+            .confidence
+            .total_cmp(&left.confidence)
+            .then_with(|| left.relative_path.cmp(&right.relative_path))
+    });
+    Ok(selected)
+}
+
+fn apply_persisted_link(
+    source: &mut story_sources::StorySource,
+    link: &crate::db::TranscriptPersonLink,
+) -> Result<()> {
+    source.link_status.clone_from(&link.status);
+    source.confidence = link.confidence;
+    source.match_evidence = serde_json::from_str(&link.evidence_json)
+        .context("parsing stored transcript-person link evidence")?;
+    Ok(())
+}
+
+fn person_identity(
+    xref: &str,
+    person: &crate::gedcom::parser::Person<'_>,
+    graph: &crate::gedcom::graph::FamilyGraph<'_, '_>,
+    tree_key: &str,
+) -> PersonIdentity {
+    let mut related_names = graph
+        .parents
+        .get(xref)
+        .into_iter()
+        .flatten()
+        .chain(graph.children.get(xref).into_iter().flatten())
+        .chain(graph.spouses.get(xref).into_iter().flatten())
+        .filter_map(|related| graph.people.get(related).and_then(|person| person.name))
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    related_names.sort();
+    related_names.dedup();
+    PersonIdentity {
+        tree_key: tree_key.to_owned(),
+        xref: xref.to_owned(),
+        name: person.name.unwrap_or("Unknown individual").to_owned(),
+        birth_year: person
+            .birth
+            .as_ref()
+            .and_then(|event| event.date)
+            .and_then(parser::date_year),
+        birth_place: person
+            .birth
+            .as_ref()
+            .and_then(|event| event.place)
+            .map(str::to_owned),
+        event_years: person
+            .events
+            .iter()
+            .filter_map(|event| event.date.and_then(parser::date_year))
+            .collect(),
+        event_places: person
+            .events
+            .iter()
+            .filter_map(|event| event.place.map(str::to_owned))
+            .collect(),
+        related_names,
+    }
+}
+
 fn data_directory(state: &AppState) -> PathBuf {
     state
         .config
@@ -594,43 +853,6 @@ fn data_directory(state: &AppState) -> PathBuf {
         .parent()
         .unwrap_or_else(|| Path::new("."))
         .to_path_buf()
-}
-
-fn collect_transcript_facts(records: &Path) -> anyhow::Result<String> {
-    let mut facts = Vec::new();
-    if !records.is_dir() {
-        return Ok(String::new());
-    }
-    for entry in walkdir::WalkDir::new(records).follow_links(false) {
-        let entry = entry?;
-        if !entry.file_type().is_file()
-            || entry.path().extension().and_then(|ext| ext.to_str()) != Some("md")
-        {
-            continue;
-        }
-        let text = fs::read_to_string(entry.path())?;
-        if let Some(metadata) = crate::transcript_data::read_for_transcript(entry.path())? {
-            facts.push(format!(
-                "{}:\n{}",
-                entry.path().display(),
-                serde_json::to_string_pretty(&metadata)?
-            ));
-        } else if let Some(yaml) = frontmatter(&text) {
-            facts.push(format!("{}:\n{}", entry.path().display(), yaml));
-        } else {
-            facts.push(format!(
-                "{}:\n[No validated structured transcript JSON is available.]",
-                entry.path().display()
-            ));
-        }
-    }
-    Ok(facts.join("\n\n"))
-}
-
-fn frontmatter(text: &str) -> Option<&str> {
-    let content = text.strip_prefix("---")?;
-    let end = content.find("\n---")?;
-    Some(&content[..end])
 }
 
 fn person_facts(

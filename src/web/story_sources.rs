@@ -1,23 +1,48 @@
-use anyhow::Result;
-use serde_yaml::Value;
-use std::{collections::HashSet, fs, path::Path};
+use anyhow::{bail, Context, Result};
+use sha2::{Digest, Sha256};
+use std::{
+    collections::HashSet,
+    fs,
+    io::ErrorKind,
+    path::{Component, Path},
+};
 
 const FUZZY_NAME_THRESHOLD: f64 = 0.78;
 
 #[derive(Clone, Debug, Default)]
 pub struct PersonIdentity {
+    pub tree_key: String,
+    pub xref: String,
     pub name: String,
     pub birth_year: Option<i32>,
     pub birth_place: Option<String>,
     pub event_years: Vec<i32>,
     pub event_places: Vec<String>,
+    pub related_names: Vec<String>,
+}
+
+impl PersonIdentity {
+    pub fn stable_key(&self) -> String {
+        let identity = format!(
+            "{}\0{}\0{}\0{}",
+            self.tree_key,
+            self.xref,
+            normalize_name(&self.name),
+            self.birth_year
+                .map_or_else(String::new, |year| year.to_string())
+        );
+        hex::encode(Sha256::digest(identity.as_bytes()))
+    }
 }
 
 #[derive(Clone, Debug)]
 pub struct StorySource {
     pub relative_path: String,
     pub contents: String,
+    pub transcript_sha256: String,
+    pub confidence: f64,
     pub match_evidence: Vec<String>,
+    pub link_status: String,
 }
 
 pub fn collect_person_sources(records: &Path, person: &PersonIdentity) -> Result<Vec<StorySource>> {
@@ -26,257 +51,208 @@ pub fn collect_person_sources(records: &Path, person: &PersonIdentity) -> Result
         return Ok(matches);
     }
 
-    for entry in walkdir::WalkDir::new(records).follow_links(false) {
+    for entry in walkdir::WalkDir::new(records)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|entry| {
+            entry.depth() == 0 || !entry.file_name().to_string_lossy().starts_with('.')
+        })
+    {
         let entry = entry?;
         if !entry.file_type().is_file()
-            || entry.path().extension().and_then(|ext| ext.to_str()) != Some("md")
+            || !entry
+                .path()
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("md"))
         {
             continue;
         }
-        let contents = fs::read_to_string(entry.path())?;
+        let raw_contents = fs::read_to_string(entry.path())
+            .with_context(|| format!("reading transcript {}", entry.path().display()))?;
+        let contents = crate::gemini_client::normalize_transcript(&raw_contents);
         let relative_path = entry
             .path()
             .strip_prefix(records)?
             .to_string_lossy()
             .replace('\\', "/");
-        let metadata = match crate::transcript_data::read_for_transcript(entry.path())? {
-            Some(metadata) => crate::transcript_data::to_legacy_metadata(&metadata)?,
-            None => {
-                let Some(frontmatter) = extract_frontmatter(&contents) else {
-                    continue;
-                };
-                let Ok(metadata) = serde_yaml::from_str::<Value>(frontmatter) else {
-                    continue;
-                };
-                metadata
-            }
+        let Some((confidence, match_evidence)) =
+            matching_evidence(&relative_path, &contents, person)
+        else {
+            continue;
         };
-        if let Some(match_evidence) = matching_evidence(&metadata, &relative_path, person) {
-            matches.push(StorySource {
-                relative_path,
-                contents,
-                match_evidence,
-            });
-        }
+        matches.push(StorySource {
+            relative_path,
+            transcript_sha256: sha256_text(&raw_contents),
+            contents,
+            confidence,
+            match_evidence,
+            link_status: "suggested".to_owned(),
+        });
     }
 
-    matches.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+    matches.sort_by(|left, right| {
+        right
+            .confidence
+            .total_cmp(&left.confidence)
+            .then_with(|| left.relative_path.cmp(&right.relative_path))
+    });
     Ok(matches)
 }
 
+pub fn read_transcript(records: &Path, relative_path: &str) -> Result<Option<StorySource>> {
+    let relative = Path::new(relative_path);
+    if relative.as_os_str().is_empty()
+        || relative
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        bail!("transcript path must be a normalized path relative to the records directory");
+    }
+    if !relative
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("md"))
+    {
+        bail!("linked source is not a Markdown transcript");
+    }
+    let root = fs::canonicalize(records)
+        .with_context(|| format!("resolving records directory {}", records.display()))?;
+    let path = match fs::canonicalize(root.join(relative)) {
+        Ok(path) => path,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).context("resolving linked transcript path"),
+    };
+    if !path.starts_with(&root) {
+        bail!("linked transcript resolves outside the records directory");
+    }
+    let raw_contents = fs::read_to_string(&path)
+        .with_context(|| format!("reading linked transcript {}", path.display()))?;
+    let contents = crate::gemini_client::normalize_transcript(&raw_contents);
+    Ok(Some(StorySource {
+        relative_path: relative_path.replace('\\', "/"),
+        transcript_sha256: sha256_text(&raw_contents),
+        contents,
+        confidence: 0.0,
+        match_evidence: Vec::new(),
+        link_status: "confirmed".to_owned(),
+    }))
+}
+
 fn matching_evidence(
-    metadata: &Value,
     relative_path: &str,
+    contents: &str,
     person: &PersonIdentity,
-) -> Option<Vec<String>> {
-    let source_years = metadata_years(metadata)
+) -> Option<(f64, Vec<String>)> {
+    let exact_name_in_text = has_name_sequence(contents, &person.name);
+    let exact_name_in_path = has_name_sequence(relative_path, &person.name);
+    let text_similarity = best_phrase_similarity(&person.name, contents);
+    let path_similarity = name_similarity(&person.name, relative_path);
+    let source_years = years_in(contents)
         .into_iter()
         .chain(years_in(relative_path))
         .collect::<HashSet<_>>();
-    let filename_name_score = name_similarity(&person.name, relative_path);
-    let exact_name_in_path = has_name_sequence(relative_path, &person.name);
-    let mut path_evidence = Vec::new();
-    if person
+    let year_match = person
         .birth_year
         .is_some_and(|year| source_years.contains(&year))
-    {
-        path_evidence.push("GEDCOM birth year appears in transcript dates or file path".to_owned());
-    }
-    path_evidence.extend(event_date_evidence(&source_years, person));
-    let mut best: Option<(f64, Vec<String>)> = None;
-
-    if exact_name_in_path && !path_evidence.is_empty() {
-        best = Some((
-            1.05,
-            std::iter::once("exact person name in file path".to_owned())
-                .chain(path_evidence.iter().cloned())
-                .collect(),
-        ));
-    }
-
-    if let Some(individuals) = metadata
-        .get("primary_individuals")
-        .and_then(Value::as_sequence)
-    {
-        for individual in individuals {
-            let Some(name) = individual
-                .as_mapping()
-                .and_then(|mapping| mapping_value(mapping, "name"))
-                .and_then(Value::as_str)
-            else {
-                continue;
-            };
-            let name_score = name_similarity(&person.name, name);
-            if normalize_name(name) == normalize_name(&person.name)
-                || has_name_sequence(name, &person.name)
-            {
-                let evidence = vec!["exact person name in transcript metadata".to_owned()];
-                keep_better(&mut best, 1.1, evidence);
-                continue;
-            }
-
-            let corroboration =
-                corroborating_evidence_for_individual(individual, &source_years, person);
-            let score = name_score.max(filename_name_score);
-            if score >= FUZZY_NAME_THRESHOLD && !corroboration.is_empty() {
-                let mut evidence = Vec::new();
-                if name_score >= FUZZY_NAME_THRESHOLD {
-                    evidence.push(format!(
-                        "similar name in transcript metadata ({}% similarity)",
-                        (name_score * 100.0).round() as u32
-                    ));
-                }
-                if exact_name_in_path {
-                    evidence.push("exact person name in file path".to_owned());
-                } else if filename_name_score >= FUZZY_NAME_THRESHOLD {
-                    evidence.push(format!(
-                        "similar name in file path ({}% similarity)",
-                        (filename_name_score * 100.0).round() as u32
-                    ));
-                }
-                evidence.extend(corroboration);
-                keep_better(&mut best, score, evidence);
-            }
-        }
-    }
-
-    best.map(|(_, evidence)| evidence)
-}
-
-fn keep_better(best: &mut Option<(f64, Vec<String>)>, score: f64, evidence: Vec<String>) {
-    if best.as_ref().map_or(true, |(current, _)| score > *current) {
-        *best = Some((score, evidence));
-    }
-}
-
-fn corroborating_evidence_for_individual(
-    individual: &Value,
-    source_years: &HashSet<i32>,
-    person: &PersonIdentity,
-) -> Vec<String> {
-    let mut evidence = Vec::new();
-    if person
-        .birth_year
-        .is_some_and(|year| source_years.contains(&year))
-    {
-        evidence.push("GEDCOM birth year appears in transcript dates or file path".to_owned());
-    }
-
-    if let Some(age) = individual
-        .as_mapping()
-        .and_then(|mapping| mapping_value(mapping, "age"))
-        .and_then(value_as_i32)
-    {
-        if person.birth_year.is_some_and(|birth_year| {
-            source_years
-                .iter()
-                .any(|year| (*year - age - birth_year).abs() <= 1)
-        }) {
-            evidence.push("transcribed age is compatible with GEDCOM birth year".to_owned());
-        }
-    }
-
-    let birthplace = individual
-        .as_mapping()
-        .and_then(|mapping| mapping_value(mapping, "birthplace"));
-    if birthplace_matches(birthplace, person) {
-        evidence.push("transcript birthplace is consistent with GEDCOM".to_owned());
-    }
-    evidence.extend(event_date_evidence(source_years, person));
-    evidence
-}
-
-fn mapping_value<'a>(mapping: &'a serde_yaml::Mapping, key: &str) -> Option<&'a Value> {
-    mapping.get(&Value::String(key.to_owned()))
-}
-
-fn event_date_evidence(source_years: &HashSet<i32>, person: &PersonIdentity) -> Vec<String> {
-    if person
-        .event_years
-        .iter()
-        .any(|year| source_years.contains(year))
-    {
-        vec!["a GEDCOM event year appears in transcript dates or file path".to_owned()]
-    } else {
-        Vec::new()
-    }
-}
-
-fn birthplace_matches(value: Option<&Value>, person: &PersonIdentity) -> bool {
-    let Some(candidate) = value.and_then(value_as_text) else {
-        return false;
-    };
-    person
+        || person
+            .event_years
+            .iter()
+            .any(|year| source_years.contains(year));
+    let place_match = person
         .birth_place
         .as_deref()
-        .is_some_and(|target| place_similarity(target, &candidate) >= 0.6)
+        .is_some_and(|place| contains_place(contents, place))
         || person
             .event_places
             .iter()
-            .any(|place| place_similarity(place, &candidate) >= 0.75)
+            .any(|place| contains_place(contents, place));
+    let related_names = person
+        .related_names
+        .iter()
+        .filter(|name| has_name_sequence(contents, name))
+        .collect::<Vec<_>>();
+    let all_name_tokens_present = tokens(&person.name)
+        .iter()
+        .all(|token| tokens(contents).iter().any(|source| source == token));
+    let corroborated = year_match || place_match || !related_names.is_empty();
+    let fuzzy_name_in_text = text_similarity >= FUZZY_NAME_THRESHOLD && corroborated;
+    let path_match_with_context =
+        (exact_name_in_path || path_similarity >= FUZZY_NAME_THRESHOLD) && corroborated;
+    let grouped_name_match = all_name_tokens_present
+        && (exact_name_in_path || corroborated)
+        && tokens(&person.name).len() > 1;
+
+    if !exact_name_in_text && !fuzzy_name_in_text && !path_match_with_context && !grouped_name_match
+    {
+        return None;
+    }
+
+    let mut evidence = Vec::new();
+    if exact_name_in_text {
+        evidence.push("exact name appears in transcript text".to_owned());
+    } else if fuzzy_name_in_text || grouped_name_match {
+        evidence.push("name tokens or a close OCR variant appear in transcript text".to_owned());
+    }
+    if exact_name_in_path {
+        evidence.push("exact name appears in transcript path".to_owned());
+    } else if path_similarity >= FUZZY_NAME_THRESHOLD {
+        evidence.push("similar name appears in transcript path".to_owned());
+    }
+    if year_match {
+        evidence.push("a GEDCOM birth or event year appears in transcript text or path".to_owned());
+    }
+    if place_match {
+        evidence.push("a GEDCOM birth or event place appears in transcript text".to_owned());
+    }
+    if !related_names.is_empty() {
+        evidence.push(format!(
+            "GEDCOM relative name(s) also appear: {}",
+            related_names
+                .into_iter()
+                .map(|name| name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+
+    let mut confidence: f64 = if exact_name_in_text {
+        0.68
+    } else {
+        0.52 + text_similarity.min(path_similarity) * 0.25
+    };
+    if year_match {
+        confidence += 0.12;
+    }
+    if place_match {
+        confidence += 0.08;
+    }
+    if exact_name_in_path {
+        confidence += 0.08;
+    }
+    if !related_names.is_empty() {
+        confidence += 0.08;
+    }
+    Some((confidence.min(0.99), evidence))
 }
 
-fn place_similarity(left: &str, right: &str) -> f64 {
-    let left_tokens = tokens(left).into_iter().collect::<HashSet<_>>();
-    let right_tokens = tokens(right).into_iter().collect::<HashSet<_>>();
-    if left_tokens.is_empty() || right_tokens.is_empty() {
+fn best_phrase_similarity(name: &str, text: &str) -> f64 {
+    let name_tokens = tokens(name);
+    let source_tokens = tokens(text);
+    if name_tokens.is_empty() || source_tokens.len() < name_tokens.len() {
         return 0.0;
     }
-    let shared = left_tokens.intersection(&right_tokens).count();
-    shared as f64 / left_tokens.len().min(right_tokens.len()) as f64
+    source_tokens
+        .windows(name_tokens.len())
+        .map(|window| name_similarity(&name_tokens.join(" "), &window.join(" ")))
+        .fold(0.0, f64::max)
 }
 
-fn value_as_text(value: &Value) -> Option<String> {
-    match value {
-        Value::String(text) => Some(text.clone()),
-        Value::Number(number) => Some(number.to_string()),
-        _ => None,
-    }
-}
-
-fn value_as_i32(value: &Value) -> Option<i32> {
-    match value {
-        Value::Number(number) => number.as_i64()?.try_into().ok(),
-        Value::String(text) => text.parse().ok(),
-        _ => None,
-    }
-}
-
-fn metadata_years(metadata: &Value) -> Vec<i32> {
-    let mut years = metadata
-        .get("title_as_written")
-        .and_then(value_as_text)
-        .into_iter()
-        .flat_map(|title| years_in(&title))
-        .chain(
-            metadata
-                .get("date_recorded")
-                .and_then(value_as_text)
-                .into_iter()
-                .flat_map(|date| years_in(&date)),
-        )
-        .collect::<Vec<_>>();
-    if let Some(dates) = metadata.get("all_extracted_dates") {
-        collect_value_years(dates, &mut years);
-    }
-    years
-}
-
-fn collect_value_years(value: &Value, years: &mut Vec<i32>) {
-    match value {
-        Value::String(text) => years.extend(years_in(text)),
-        Value::Sequence(items) => {
-            for item in items {
-                collect_value_years(item, years);
-            }
-        }
-        Value::Mapping(mapping) => {
-            for value in mapping.values() {
-                collect_value_years(value, years);
-            }
-        }
-        _ => {}
-    }
+fn contains_place(text: &str, place: &str) -> bool {
+    let text_tokens = tokens(text).into_iter().collect::<HashSet<_>>();
+    let place_tokens = tokens(place);
+    has_name_sequence(text, place)
+        || place_tokens.len() > 1 && place_tokens.iter().all(|token| text_tokens.contains(token))
 }
 
 fn years_in(text: &str) -> Vec<i32> {
@@ -302,29 +278,23 @@ fn name_similarity(left: &str, right: &str) -> f64 {
     if left.is_empty() || right.is_empty() {
         return 0.0;
     }
-    let scores = left
-        .iter()
+    left.iter()
         .map(|target| {
-            if right.iter().any(|candidate| candidate == target) {
-                1.0
-            } else {
-                right
-                    .iter()
-                    .map(|candidate| word_similarity(target, candidate))
-                    .fold(0.0, f64::max)
-            }
+            right
+                .iter()
+                .map(|candidate| word_similarity(target, candidate))
+                .fold(0.0, f64::max)
         })
-        .collect::<Vec<_>>();
-    scores.iter().sum::<f64>() / scores.len() as f64
+        .sum::<f64>()
+        / left.len() as f64
 }
 
 fn word_similarity(left: &str, right: &str) -> f64 {
     let longest = left.chars().count().max(right.chars().count());
     if longest < 4 {
-        return 0.0;
+        return if left == right { 1.0 } else { 0.0 };
     }
-    let distance = levenshtein(left, right);
-    1.0 - distance as f64 / longest as f64
+    1.0 - levenshtein(left, right) as f64 / longest as f64
 }
 
 fn levenshtein(left: &str, right: &str) -> usize {
@@ -360,92 +330,102 @@ fn normalize_name(value: &str) -> String {
         .join(" ")
 }
 
-fn extract_frontmatter(text: &str) -> Option<&str> {
-    let content = text.strip_prefix("---")?;
-    let end = content.find("\n---")?;
-    Some(&content[..end])
+fn sha256_text(text: &str) -> String {
+    hex::encode(Sha256::digest(text.as_bytes()))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{collect_person_sources, name_similarity, PersonIdentity};
+    use super::{collect_person_sources, read_transcript, PersonIdentity};
     use std::fs;
 
     #[test]
-    fn fuzzy_name_is_linked_when_filename_birth_year_confirms_identity() {
+    fn exact_name_and_year_in_body_suggest_a_body_only_transcript() {
         let directory = tempfile::tempdir().expect("temporary records directory");
-        let person_directory = directory.path().join("Arthur Astle (1870)");
-        fs::create_dir(&person_directory).expect("create person directory");
-        let transcript = person_directory.join("1901 Census.md");
-        fs::write(
-            &transcript,
-            "---\nprimary_individuals:\n  - name: Arthur Aalle\n    age: 30\n    birthplace: West Ham\n---\nCensus row",
-        )
-        .expect("write transcript");
         let person = PersonIdentity {
+            xref: "@I1@".to_owned(),
             name: "Arthur /Astle/".to_owned(),
             birth_year: Some(1870),
-            birth_place: Some("West Ham".to_owned()),
             ..PersonIdentity::default()
         };
+        fs::write(
+            directory.path().join("baptism.md"),
+            "Baptism register\nArthur Astle, born 1870.",
+        )
+        .expect("write transcript");
 
         let sources = collect_person_sources(directory.path(), &person).expect("find sources");
         assert_eq!(sources.len(), 1);
         assert!(sources[0]
             .match_evidence
             .iter()
-            .any(|evidence| evidence.contains("birth year")));
+            .any(|evidence| evidence.contains("exact name")));
+        assert_eq!(sources[0].link_status, "suggested");
     }
 
     #[test]
-    fn age_and_birthplace_can_corroborate_a_fuzzy_name() {
+    fn fuzzy_name_requires_independent_year_or_family_context() {
         let directory = tempfile::tempdir().expect("temporary records directory");
         fs::write(
-            directory.path().join("1901 Census.md"),
-            "---\ndate_recorded: 1901\nprimary_individuals:\n  - name: Arthur Aalle\n    age: 30\n    birthplace: West Ham\n---\nCensus row",
+            directory.path().join("record.md"),
+            "Arthur Aalle appears in the record.",
         )
         .expect("write transcript");
         let person = PersonIdentity {
-            name: "Arthur /Astle/".to_owned(),
-            birth_year: Some(1870),
-            birth_place: Some("West Ham".to_owned()),
-            ..PersonIdentity::default()
-        };
-
-        let sources = collect_person_sources(directory.path(), &person).expect("find sources");
-        assert_eq!(sources.len(), 1);
-        assert!(sources[0]
-            .match_evidence
-            .iter()
-            .any(|evidence| evidence.contains("age")));
-        assert!(sources[0]
-            .match_evidence
-            .iter()
-            .any(|evidence| evidence.contains("birthplace")));
-    }
-
-    #[test]
-    fn fuzzy_name_alone_is_not_enough_to_link_a_source() {
-        let directory = tempfile::tempdir().expect("temporary records directory");
-        fs::write(
-            directory.path().join("Arthur Aalle.md"),
-            "---\nprimary_individuals:\n  - name: Arthur Aalle\n---\nRecord",
-        )
-        .expect("write transcript");
-        let person = PersonIdentity {
+            xref: "@I1@".to_owned(),
             name: "Arthur /Astle/".to_owned(),
             birth_year: Some(1870),
             ..PersonIdentity::default()
         };
-
         assert!(collect_person_sources(directory.path(), &person)
             .expect("find sources")
             .is_empty());
+
+        fs::write(
+            directory.path().join("record.md"),
+            "Arthur Aalle appears in 1901; his father John Astle is listed.",
+        )
+        .expect("update transcript");
+        let mut person = person;
+        person.related_names.push("John Astle".to_owned());
+        let sources = collect_person_sources(directory.path(), &person).expect("find sources");
+        assert_eq!(sources.len(), 1);
     }
 
     #[test]
-    fn fuzzy_name_score_handles_single_letter_ocr_errors() {
-        assert!(name_similarity("Arthur /Astle/", "Arthur Aalle") >= 0.78);
-        assert!(name_similarity("Arthur /Astle/", "Arthur Jones") < 0.78);
+    fn legacy_frontmatter_does_not_drive_matching_or_reach_story_sources() {
+        let directory = tempfile::tempdir().expect("temporary records directory");
+        let person = PersonIdentity {
+            xref: "@I1@".to_owned(),
+            name: "Ada Example".to_owned(),
+            ..PersonIdentity::default()
+        };
+        fs::write(
+            directory.path().join("unrelated.md"),
+            "---\nprimary_individuals:\n  - name: Ada Example\n---\nAn unrelated record.",
+        )
+        .expect("write legacy transcript");
+        assert!(collect_person_sources(directory.path(), &person)
+            .expect("find sources")
+            .is_empty());
+
+        fs::write(
+            directory.path().join("legacy.md"),
+            "---\ndocument_type: birth register\n---\nAda Example, born in 1900.",
+        )
+        .expect("write legacy transcript with body match");
+        let sources = collect_person_sources(directory.path(), &person).expect("find sources");
+        let source = sources
+            .iter()
+            .find(|source| source.relative_path == "legacy.md")
+            .expect("body match should be discovered");
+        assert!(!source.contents.starts_with("---"));
+    }
+
+    #[test]
+    fn confirmed_transcript_paths_cannot_escape_records_root() {
+        let directory = tempfile::tempdir().expect("temporary records directory");
+        assert!(read_transcript(directory.path(), "../outside.md").is_err());
+        assert!(read_transcript(directory.path(), "source.jpg").is_err());
     }
 }

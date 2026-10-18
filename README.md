@@ -111,22 +111,19 @@ PUID=$(id -u) PGID=$(id -g) docker compose up --build
    triggers a retry as groups of ten pages followed by consolidation.
 4. **Review the transcripts.** Open the generated Markdown files and correct
    uncertain names, dates, relationships, or table alignment against the scans.
-   The Markdown body is the authoritative transcription; a separate `.json`
-   file beside it contains AI-extracted person mentions and evidence-backed
-   facts. If you edit a transcript, the next scan regenerates its JSON from the
-   edited Markdown without retranscribing an unchanged source image. Long
-   Markdown tables are extracted in small row batches; every populated table
-   cell must be accounted for before the JSON is saved. If a batch is incomplete,
-   the app retries it once and leaves extraction pending if it still fails.
+   The `.md` file is the complete transcription and the only new per-document
+   sidecar. No frontmatter or JSON companion is generated. When you request a
+   Life Story, the app searches transcript text and paths for likely sources;
+   review the suggested document-to-person links before confirming them.
 5. **Upload your GEDCOM and audit the evidence.** On **GEDCOM audit**, upload
    your `.ged` file, then run the audit. Review timeline, identity, and
    location findings as leads rather than proven errors; the report is saved
    under the configured output directory.
 6. **Generate individual Life Stories.** Enter a person's GEDCOM ID (for
-   example, `@I12@`) and choose a central stories folder or a person-specific
-   subfolder. Review the selected transcript sources, their matching clues,
-   confidence scores, and citations. Verify each claim against the original
-   record before relying on or sharing a biography.
+   example, `@I12@`) and find transcript sources. Review the suggested matches
+   and confirm only those that belong to the person; biographies use confirmed
+   sources only. Choose a central stories folder or a person-specific subfolder,
+   then verify each claim against the original record.
 7. **Repeat as your research grows.** Add new scans and start another directory
    scan; unchanged, successfully handled files are skipped. Files that failed
    remain marked as errors and are retried on a later scan. **Clear indexed
@@ -141,23 +138,17 @@ PUID=$(id -u) PGID=$(id -g) docker compose up --build
   consolidation pass.
 - Transcripts and page-level transcripts are written beside each source file
   or in the configured sidecar subfolder.
-- Each completed master Markdown transcript receives a matching `.json`
-  metadata file in a separate Gemini call that uses the Markdown transcription
-  as its input. Facts retain their source labels and values, and each fact must
-  quote and locate supporting transcript text. Invalid or failed extraction is
-  reported on the file row and retried on a later scan without retranscribing
-  the source when its Markdown is still current.
-- The CLI `scan` command reports unchanged transcripts missing valid JSON under
-  `metadata_pending`; run `process` or start a web scan to retry extraction.
+- New transcripts are body-only Markdown. Existing JSON and YAML sidecars from
+  older versions are left untouched. Legacy frontmatter in Markdown files is
+  stripped from the text supplied to source discovery and Life Story generation.
 - Settings can keep sidecars beside each source or put them in a named
   subfolder inside each source's directory. The setting is saved in SQLite;
   scanning, direct processing, CLI delta checks, PDF page transcripts, GEDCOM
   audits, and Life Story source discovery all use or recursively discover the
-  configured sidecars. Changing the location moves existing master and
-  per-page Markdown transcripts between the source directory and configured
+  configured Markdown transcripts. Changing the location moves existing master
+  and per-page Markdown transcripts between the source directory and configured
   subfolder; original documents are never moved. A move is refused if it would
-  overwrite an existing transcript. A missing JSON companion is regenerated
-  beside its transcript on the next scan.
+  overwrite an existing transcript.
 - For PDF chunk fallback, a chunk for which Gemini returns no text is retained
   as a non-error placeholder and the other chunks continue through
   consolidation. The PDF is an error only when no chunk produced transcription
@@ -171,19 +162,18 @@ PUID=$(id -u) PGID=$(id -g) docker compose up --build
   schedules, preserves ditto marks exactly, and excludes website controls from
   digitized record screenshots. A mandatory image-only safeguard instructs
   Gemini to return a structured non-document marker for clear photographs and
-  artwork; those images are saved as `filtered` without Markdown/JSON or later
+  artwork; those images are saved as `filtered` without Markdown or later
   retries unless their source changes. Existing exact copies of previous
   built-in prompts are upgraded on startup; custom prompts are left unchanged.
-  Older YAML-frontmatter transcripts remain readable by audit and source
-  matching features.
-- Structured transcript JSON uses schema version 1.2. On the next scan, older
-  JSON companions are regenerated with row-level coverage and source-column
-  checks while their Markdown transcripts remain untouched. Ditto marks in
-  table cells are expanded in JSON only, by carrying the nearest preceding
-  non-ditto value in that same column and table. Original marker text remains
-  unchanged in the evidence quote, and ditto-derived values are explicitly
-  marked as inferred. Person and relative mentions retain explicit relationship
-  direction so a child's event facts are not assigned to a parent.
+- Life Story discovery searches transcript bodies and paths using the GEDCOM
+  person's name, dates, places, and related people. Candidate matches are
+  stored in SQLite as suggested, confirmed, or rejected links, keyed by the
+  GEDCOM individual identity and transcript path/content hash. Confirmed links
+  can supplement future searches; rejecting a link excludes that transcript
+  version. Changing a transcript creates a new suggestion rather than silently
+  carrying forward an old confirmation. Only confirmed links are included in a
+  generated biography. Names and filenames are discovery clues, not proof of
+  identity; verify biographical claims against their cited transcriptions.
 - API keys are encrypted in SQLite using a local encryption key. Back up the
   `.encryption-key` file along with the database; alternatively supply a stable
   64-hex-character `GOS_MASTER_KEY`.
@@ -215,9 +205,9 @@ PUID=$(id -u) PGID=$(id -g) docker compose up --build
   checked again on the next scan.
 - Geographical anomaly checks are conservative string/date heuristics, not
   geocoding. Review flagged items manually.
-- Life story source selection can tolerate OCR name variants when other evidence
-  corroborates the match; the audit page shows the selected transcripts and
-  matching clues. The biography reviewer is instructed to interpret varied
+- Life story source discovery can tolerate OCR name variants when other evidence
+  corroborates the match; the audit page lists candidates and matching clues
+  before generation. The biography reviewer is instructed to interpret varied
   historical source formats, including surname-grouped indexes where a surname
   is printed once and applies to following given/middle-name entries until the
   next clear group or page/column boundary. Review those sources and the

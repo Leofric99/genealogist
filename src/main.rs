@@ -9,7 +9,6 @@ mod scanner;
 mod secret;
 mod sidecar;
 mod state;
-mod transcript_data;
 mod vision_filter;
 mod web;
 
@@ -142,6 +141,11 @@ async fn serve() -> Result<()> {
         .route("/api/gedcom", post(web::handlers::upload_gedcom))
         .route("/api/audit", post(web::handlers::run_audit))
         .route("/api/story/:xref", post(web::handlers::generate_story))
+        .route(
+            "/api/story/:xref/sources",
+            get(web::handlers::discover_story_sources)
+                .post(web::handlers::update_story_source_link),
+        )
         .layer(RequestBodyLimitLayer::new(25 * 1024 * 1024))
         .layer(middleware::from_fn_with_state(
             Arc::clone(&state),
@@ -164,7 +168,6 @@ fn cli_scan(directory: &std::path::Path, database: &std::path::Path) -> Result<(
     let mut new_or_modified = 0usize;
     let mut unchanged = 0usize;
     let mut existing_transcripts = 0usize;
-    let mut metadata_pending = 0usize;
     for file in &files {
         let path = file.path.to_string_lossy().into_owned();
         let indexed_hash = db.file_hash(&path)?;
@@ -172,18 +175,6 @@ fn cli_scan(directory: &std::path::Path, database: &std::path::Path) -> Result<(
         let transcript = sidecars.transcript_path(&file.path);
         let transcript_string = transcript.to_string_lossy();
         let stored_transcript = db.file_transcript_path(&path)?;
-        let metadata_current = if transcript.is_file() {
-            match transcript_data::read_for_transcript(&transcript) {
-                Ok(Some(metadata)) => transcript_data::is_current(&metadata, &file.sha256),
-                Ok(None) => false,
-                Err(error) => {
-                    eprintln!("{}: {error:#}", transcript.display());
-                    false
-                }
-            }
-        } else {
-            false
-        };
         let unchanged_and_complete = indexed_hash.as_deref() == Some(&file.sha256)
             && match status.as_deref() {
                 Some("filtered") => !transcript.is_file(),
@@ -191,7 +182,6 @@ fn cli_scan(directory: &std::path::Path, database: &std::path::Path) -> Result<(
                 Some("transcribed") | Some("external_transcript") | Some("metadata_error") => {
                     stored_transcript.as_deref() == Some(transcript_string.as_ref())
                         && transcript.is_file()
-                        && metadata_current
                 }
                 _ => false,
             };
@@ -200,16 +190,6 @@ fn cli_scan(directory: &std::path::Path, database: &std::path::Path) -> Result<(
         } else {
             if indexed_hash.as_deref() == Some(&file.sha256) && status.as_deref() == Some("error") {
                 new_or_modified += 1;
-            } else if indexed_hash.as_deref() == Some(&file.sha256)
-                && matches!(
-                    status.as_deref(),
-                    Some("transcribed") | Some("external_transcript") | Some("metadata_error")
-                )
-                && stored_transcript.as_deref() == Some(transcript_string.as_ref())
-                && transcript.is_file()
-                && !metadata_current
-            {
-                metadata_pending += 1;
             } else if transcript.is_file()
                 && status.as_deref() != Some("error")
                 && stored_transcript.as_deref() != Some(transcript_string.as_ref())
@@ -235,8 +215,7 @@ fn cli_scan(directory: &std::path::Path, database: &std::path::Path) -> Result<(
             "discovered": files.len(),
             "new_or_modified": new_or_modified,
             "unchanged": unchanged,
-            "matching_transcript": existing_transcripts,
-            "metadata_pending": metadata_pending
+            "matching_transcript": existing_transcripts
         }))?
     );
     Ok(())

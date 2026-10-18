@@ -69,10 +69,6 @@ impl SidecarConfig {
         }
     }
 
-    pub fn metadata_path(&self, source: &Path) -> PathBuf {
-        self.transcript_path(source).with_extension("json")
-    }
-
     pub fn page_transcript_path(&self, source: &Path, page: usize) -> PathBuf {
         let transcript = self.transcript_path(source);
         let stem = source
@@ -265,22 +261,11 @@ mod tests {
             Path::new("records").join("person").join("record.md")
         );
         assert_eq!(
-            same.metadata_path(&source),
-            Path::new("records").join("person").join("record.json")
-        );
-        assert_eq!(
             nested.transcript_path(&source),
             Path::new("records")
                 .join("person")
                 .join("OCR Transcripts")
                 .join("record.md")
-        );
-        assert_eq!(
-            nested.metadata_path(&source),
-            Path::new("records")
-                .join("person")
-                .join("OCR Transcripts")
-                .join("record.json")
         );
         assert_eq!(
             nested.page_transcript_path(&source, 3),

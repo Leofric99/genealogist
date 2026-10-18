@@ -22,10 +22,10 @@
   </div>
   <div class="card">
     <h2>Life story biography</h2>
-    <p class="muted">Enter a GEDCOM individual identifier (for example, @I12@). Each section shows evidence confidence; every factual line must cite a selected transcript. Name variants are matched only when other record evidence supports them.</p>
+    <p class="muted">Enter a GEDCOM individual identifier (for example, @I12@), find transcript candidates, and confirm the sources to use. Biographies use confirmed sources only; each factual line must cite a selected transcript.</p>
     <form @submit.prevent="story()">
       <label>Individual ID
-        <input type="text" x-model="personId" placeholder="@I12@" required>
+        <input type="text" x-model="personId" @change="storySources = []" placeholder="@I12@" required>
       </label>
       <label>Output location
         <select x-model="destination">
@@ -33,14 +33,21 @@
           <option value="person">Individual subfolder</option>
         </select>
       </label>
+      <button type="button" @click="discoverSources()" :disabled="busy">Find transcript sources</button>
       <button type="submit" :disabled="busy">Generate biography</button>
     </form>
     <p class="muted" x-text="storyMessage"></p>
     <div x-show="storySources.length">
-      <h3>Selected transcript sources</h3>
+      <h3>Transcript-to-person mappings</h3>
+      <p class="muted">New matches are suggestions and are not used in biographies until confirmed. Rejected links are excluded for this transcript version.</p>
       <ul>
         <template x-for="source in storySources" :key="source.path">
-          <li><code x-text="source.path"></code> <span class="muted" x-text="`— ${source.evidence.join('; ')}`"></span></li>
+          <li>
+            <code x-text="source.path"></code>
+            <span class="muted" x-text="`— ${source.evidence.join('; ')} (${Math.round(source.confidence * 100)}%, ${source.status})`"></span>
+            <button type="button" @click="updateSource(source, 'confirm')" :disabled="busy || source.status === 'confirmed'">Confirm</button>
+            <button type="button" @click="updateSource(source, 'reject')" :disabled="busy || source.status === 'rejected'">Reject</button>
+          </li>
         </template>
       </ul>
     </div>
@@ -51,6 +58,18 @@ function auditPage() {
   return {
     busy: false, uploadMessage: "", message: "", result: "", anomalyCount: 0,
     personId: "", destination: "central", storyMessage: "", storySources: [],
+    async discoverSources() {
+      this.busy = true; this.storyMessage = "Finding transcript candidates…";
+      this.storySources = [];
+      try {
+        const response = await fetch(`/api/story/${encodeURIComponent(this.personId)}/sources`);
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || "Source discovery failed");
+        this.storySources = data.matched_sources || [];
+        this.storyMessage = `Found ${this.storySources.length} transcript candidate(s) for ${data.person_name}. Confirm the sources to use in a biography.`;
+      } catch (error) { this.storyMessage = error.message; }
+      finally { this.busy = false; }
+    },
     async upload() {
       this.busy = true; this.uploadMessage = "Uploading…";
       try {
@@ -77,7 +96,6 @@ function auditPage() {
     },
     async story() {
       this.busy = true; this.storyMessage = "Generating cited biography…";
-      this.storySources = [];
       try {
         const response = await fetch(`/api/story/${encodeURIComponent(this.personId)}`, {
           method: "POST", headers: { "Content-Type": "application/json" },
@@ -87,6 +105,24 @@ function auditPage() {
         if (!response.ok) throw new Error(data.error || "Biography generation failed");
         this.storySources = data.matched_sources || [];
         this.storyMessage = `Saved to ${data.path} using ${data.sources} transcript source(s).`;
+      } catch (error) { this.storyMessage = error.message; }
+      finally { this.busy = false; }
+    },
+    async updateSource(source, action) {
+      this.busy = true;
+      try {
+        const response = await fetch(`/api/story/${encodeURIComponent(this.personId)}/sources`, {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            transcript_path: source.path,
+            transcript_sha256: source.transcript_sha256,
+            action
+          })
+        });
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || "Source mapping update failed");
+        source.status = data.status;
+        this.storyMessage = `${source.path} is now ${data.status} for ${this.personId}.`;
       } catch (error) { this.storyMessage = error.message; }
       finally { this.busy = false; }
     }

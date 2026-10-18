@@ -2,7 +2,7 @@ use super::{
     graph::FamilyGraph,
     parser::{date_year, Gedcom},
 };
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use std::{collections::HashMap, fs, path::Path};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -12,13 +12,6 @@ pub struct Anomaly {
     pub people: Vec<String>,
     pub detail: String,
     pub source: Option<String>,
-}
-
-#[derive(Debug, Deserialize, Default)]
-struct TranscriptFrontmatter {
-    primary_individuals: Option<serde_yaml::Value>,
-    all_extracted_dates: Option<serde_yaml::Value>,
-    title_as_written: Option<String>,
 }
 
 pub fn check(gedcom: &Gedcom<'_>, transcript_dir: &Path) -> anyhow::Result<Vec<Anomaly>> {
@@ -189,96 +182,35 @@ fn check_duplicate_identity(
             continue;
         }
         let text = fs::read_to_string(entry.path())?;
-        let frontmatter: TranscriptFrontmatter =
-            match crate::transcript_data::read_for_transcript(entry.path())? {
-                Some(metadata) => {
-                    serde_yaml::from_value(crate::transcript_data::to_legacy_metadata(&metadata)?)?
-                }
-                None => {
-                    let Some(frontmatter) = extract_frontmatter(&text) else {
-                        continue;
-                    };
-                    match serde_yaml::from_str(frontmatter) {
-                        Ok(value) => value,
-                        Err(_) => continue,
-                    }
-                }
-            };
-        let identities = frontmatter
-            .primary_individuals
-            .as_ref()
-            .map(identities)
-            .unwrap_or_default();
-        let mut dates = frontmatter
-            .all_extracted_dates
-            .as_ref()
-            .map(date_values)
-            .unwrap_or_default();
-        if let Some(title) = frontmatter.title_as_written {
-            dates.push(title);
-        }
-        for identity in identities {
-            for date in &dates {
-                let Some(year) = date_year(date) else {
-                    continue;
-                };
-                if let Some(ids) = known.get(&(normalize_name(&identity), year)) {
-                    if ids.len() > 1 {
-                        anomalies.push(Anomaly {
-                            rule: "ambiguous_transcript_identity".to_owned(),
-                            severity: "medium".to_owned(),
-                            people: ids.clone(),
-                            detail: format!("Transcript identifies '{identity}' and includes year {year}, matching multiple GEDCOM individuals."),
-                            source: Some(entry.path().display().to_string()),
-                        });
-                    }
-                }
+        let normalized_text = format!(" {} ", normalize_name(&text));
+        let path = entry.path().to_string_lossy();
+        let years = years_in(&text)
+            .into_iter()
+            .chain(years_in(&path))
+            .collect::<std::collections::HashSet<_>>();
+        for ((name, year), ids) in known.iter().filter(|(_, ids)| ids.len() > 1) {
+            if normalized_text.contains(&format!(" {name} ")) && years.contains(year) {
+                anomalies.push(Anomaly {
+                    rule: "ambiguous_transcript_identity".to_owned(),
+                    severity: "medium".to_owned(),
+                    people: ids.clone(),
+                    detail: format!(
+                        "Transcript text mentions '{name}' and includes year {year}, matching multiple GEDCOM individuals."
+                    ),
+                    source: Some(entry.path().display().to_string()),
+                });
             }
         }
     }
     Ok(())
 }
 
-fn extract_frontmatter(text: &str) -> Option<&str> {
-    let content = text.strip_prefix("---")?;
-    let end = content.find("\n---")?;
-    Some(&content[..end])
-}
-
-fn identities(value: &serde_yaml::Value) -> Vec<String> {
-    match value {
-        serde_yaml::Value::Sequence(items) => items
-            .iter()
-            .filter_map(|item| match item {
-                serde_yaml::Value::String(name) => Some(name.clone()),
-                serde_yaml::Value::Mapping(map) => map
-                    .get(&serde_yaml::Value::String("name".to_owned()))
-                    .and_then(serde_yaml::Value::as_str)
-                    .map(str::to_owned),
-                _ => None,
-            })
-            .collect(),
-        serde_yaml::Value::String(name) => vec![name.clone()],
-        _ => Vec::new(),
-    }
-}
-
-fn date_values(value: &serde_yaml::Value) -> Vec<String> {
-    match value {
-        serde_yaml::Value::Sequence(items) => items
-            .iter()
-            .filter_map(|item| match item {
-                serde_yaml::Value::String(date) => Some(date.clone()),
-                serde_yaml::Value::Mapping(map) => map
-                    .get(&serde_yaml::Value::String("date".to_owned()))
-                    .and_then(serde_yaml::Value::as_str)
-                    .map(str::to_owned),
-                _ => None,
-            })
-            .collect(),
-        serde_yaml::Value::String(date) => vec![date.clone()],
-        _ => Vec::new(),
-    }
+fn years_in(text: &str) -> Vec<i32> {
+    text.split(|character: char| !character.is_ascii_digit())
+        .filter(|part| part.len() == 4)
+        .filter_map(|part| part.parse::<i32>().ok())
+        .filter(|year| (1500..=2100).contains(year))
+        .collect()
 }
 
 fn normalize_name(value: &str) -> String {
@@ -309,5 +241,26 @@ mod tests {
         assert!(findings
             .iter()
             .any(|finding| finding.rule == "child_after_parent_death"));
+    }
+
+    #[test]
+    fn finds_ambiguous_people_from_body_only_transcripts() {
+        let input = "0 @I1@ INDI\n1 NAME Ada /Example/\n1 BIRT\n2 DATE 1900\n0 @I2@ INDI\n1 NAME Ada /Example/\n1 BIRT\n2 DATE 1900\n";
+        let gedcom = parser::parse(input);
+        let directory = tempfile::tempdir().expect("temporary transcript directory");
+        std::fs::write(
+            directory.path().join("register.md"),
+            "Birth register entry: Ada Example, 1900.",
+        )
+        .expect("write body-only transcript");
+
+        let findings = check(&gedcom, directory.path()).expect("run GEDCOM rule checks");
+        assert!(findings.iter().any(|finding| {
+            finding.rule == "ambiguous_transcript_identity"
+                && finding
+                    .source
+                    .as_deref()
+                    .is_some_and(|path| path.ends_with("register.md"))
+        }));
     }
 }
