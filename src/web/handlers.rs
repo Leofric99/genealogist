@@ -71,6 +71,18 @@ pub struct TestKeyRequest {
 #[derive(Deserialize)]
 pub struct StoryRequest {
     pub destination: Option<String>,
+    pub selected_sources: Option<Vec<StorySourceSelection>>,
+}
+
+#[derive(Deserialize)]
+pub struct StorySourceSelection {
+    pub transcript_path: String,
+    pub transcript_sha256: String,
+}
+
+#[derive(Deserialize)]
+pub struct StoryBatchRequest {
+    pub destination: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -498,18 +510,108 @@ pub async fn generate_story(
             "GEDCOM individual was not found".to_owned(),
         )
     })?;
-    let name = person.name.unwrap_or("Unknown individual");
     let identity = person_identity(&xref, person, &graph, &tree_key);
+    let facts = person_facts(person, &graph);
+    let generated = create_story(
+        &state,
+        &xref,
+        &identity,
+        &facts,
+        request.destination.as_deref(),
+        request.selected_sources,
+        true,
+    )
+    .await?;
+    Ok(Json(json!({
+        "path": generated.path,
+        "sources": generated.sources.len(),
+        "matched_sources": source_summaries(&generated.sources),
+    })))
+}
+
+struct GeneratedStory {
+    path: PathBuf,
+    sources: Vec<story_sources::StorySource>,
+}
+
+async fn create_story(
+    state: &AppState,
+    xref: &str,
+    identity: &PersonIdentity,
+    facts: &str,
+    destination: Option<&str>,
+    selected_sources: Option<Vec<StorySourceSelection>>,
+    discover_sources: bool,
+) -> Result<GeneratedStory, ApiError> {
     let records = state.config.records_dir.clone();
-    let mut sources = select_story_sources(&state, &records, &identity).await?;
-    sources.retain(|source| source.link_status == "confirmed");
+    let mut sources = if discover_sources || selected_sources.is_some() {
+        select_story_sources(state, &records, identity).await?
+    } else {
+        load_confirmed_story_sources(state, &records, identity).await?
+    };
+
+    if let Some(selected_sources) = selected_sources {
+        if selected_sources.is_empty() {
+            return Err(ApiError(
+                StatusCode::BAD_REQUEST,
+                "Select at least one transcript file for the biography".to_owned(),
+            ));
+        }
+        let mut selected_by_path = HashMap::new();
+        for selection in selected_sources {
+            if selection.transcript_path.len() > 4096 || selection.transcript_sha256.len() != 64 {
+                return Err(ApiError(
+                    StatusCode::BAD_REQUEST,
+                    "A selected transcript path or hash is invalid".to_owned(),
+                ));
+            }
+            if let Some(previous_hash) = selected_by_path.insert(
+                selection.transcript_path.clone(),
+                selection.transcript_sha256.clone(),
+            ) {
+                if previous_hash != selection.transcript_sha256 {
+                    return Err(ApiError(
+                        StatusCode::BAD_REQUEST,
+                        "A transcript was selected with conflicting versions".to_owned(),
+                    ));
+                }
+            }
+        }
+        let mut selected = selected_by_path.into_iter().collect::<Vec<_>>();
+        selected.sort_by(|left, right| left.0.cmp(&right.0));
+        if selected.iter().any(|(path, hash)| {
+            !sources
+                .iter()
+                .any(|source| source.relative_path == *path && source.transcript_sha256 == *hash)
+        }) {
+            return Err(ApiError(
+                StatusCode::CONFLICT,
+                "A selected transcript is no longer a current candidate; find sources again"
+                    .to_owned(),
+            ));
+        }
+        let person_key = identity.stable_key();
+        state
+            .db
+            .replace_confirmed_transcript_person_links(&person_key, &selected)?;
+        sources.retain(|source| {
+            selected.iter().any(|(path, hash)| {
+                source.relative_path == *path && source.transcript_sha256 == *hash
+            })
+        });
+        for source in &mut sources {
+            source.link_status = "confirmed".to_owned();
+        }
+    } else {
+        sources.retain(|source| source.link_status == "confirmed");
+    }
     if sources.is_empty() {
         return Err(ApiError(
             StatusCode::BAD_REQUEST,
             "No confirmed transcript sources are available. Find and review transcript candidates, then confirm the sources to use.".to_owned(),
         ));
     }
-    let facts = person_facts(person, &graph);
+
     let source_text = sources
         .iter()
         .map(|source| {
@@ -544,7 +646,7 @@ pub async fn generate_story(
     })?;
     let identifier = safe_component(&xref);
     let stories = state.config.output_dir.join("stories");
-    let output = if request.destination.as_deref() == Some("person") {
+    let output = if destination == Some("person") {
         stories.join(&identifier).join("biography.md")
     } else {
         stories.join(format!("{identifier}.md"))
@@ -553,7 +655,14 @@ pub async fn generate_story(
         tokio::fs::create_dir_all(parent).await?;
     }
     tokio::fs::write(&output, story).await?;
-    let matched_sources = sources
+    Ok(GeneratedStory {
+        path: output,
+        sources,
+    })
+}
+
+fn source_summaries(sources: &[story_sources::StorySource]) -> Vec<Value> {
+    sources
         .iter()
         .map(|source| {
             json!({
@@ -564,12 +673,138 @@ pub async fn generate_story(
                 "transcript_sha256": source.transcript_sha256,
             })
         })
+        .collect()
+}
+
+struct StoryBatchPerson {
+    xref: String,
+    identity: PersonIdentity,
+    facts: String,
+}
+
+pub async fn start_story_batch(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<StoryBatchRequest>,
+) -> Result<(StatusCode, Json<Value>), ApiError> {
+    api_key(&state)?;
+    let gedcom_path = state
+        .db
+        .setting("gedcom_path")?
+        .map(PathBuf::from)
+        .filter(|path| path.is_file())
+        .ok_or_else(|| {
+            ApiError(
+                StatusCode::BAD_REQUEST,
+                "Upload a GEDCOM file before generating biographies".to_owned(),
+            )
+        })?;
+    let gedcom_text = tokio::fs::read_to_string(gedcom_path).await?;
+    let tree_key = hex::encode(Sha256::digest(gedcom_text.as_bytes()));
+    let gedcom = parser::parse(&gedcom_text);
+    let graph = crate::gedcom::graph::FamilyGraph::build(&gedcom);
+    let people = graph
+        .people
+        .iter()
+        .map(|(xref, person)| StoryBatchPerson {
+            xref: (*xref).to_owned(),
+            identity: person_identity(xref, person, &graph, &tree_key),
+            facts: person_facts(person, &graph),
+        })
         .collect::<Vec<_>>();
-    Ok(Json(json!({
-        "path": output,
-        "sources": sources.len(),
-        "matched_sources": matched_sources,
-    })))
+    if people.is_empty() {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            "The uploaded GEDCOM contains no individuals".to_owned(),
+        ));
+    }
+    if !state.db.start_story_batch(people.len())? {
+        return Err(ApiError(
+            StatusCode::CONFLICT,
+            "A bulk biography job is already running".to_owned(),
+        ));
+    }
+    let status = state.db.story_batch_status()?;
+    tokio::spawn(run_story_batch(
+        Arc::clone(&state),
+        people,
+        request.destination,
+    ));
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(json!({ "started": true, "status": status })),
+    ))
+}
+
+pub async fn story_batch_status(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Value>, ApiError> {
+    Ok(Json(json!({ "status": state.db.story_batch_status()? })))
+}
+
+async fn run_story_batch(
+    state: Arc<AppState>,
+    people: Vec<StoryBatchPerson>,
+    destination: Option<String>,
+) {
+    let mut processed = 0;
+    let mut succeeded = 0;
+    let mut skipped = 0;
+    let mut failed = 0;
+    let total = people.len();
+    for person in people {
+        let message = format!("Generating biography for {}", person.identity.name);
+        if let Err(error) = state.db.update_story_batch(
+            processed,
+            succeeded,
+            skipped,
+            failed,
+            Some(&person.xref),
+            Some(&message),
+        ) {
+            tracing::error!(%error, "updating bulk biography progress failed");
+        }
+        match create_story(
+            &state,
+            &person.xref,
+            &person.identity,
+            &person.facts,
+            destination.as_deref(),
+            None,
+            false,
+        )
+        .await
+        {
+            Ok(_) => succeeded += 1,
+            Err(error)
+                if error.0 == StatusCode::BAD_REQUEST
+                    && error.1.starts_with("No confirmed transcript sources") =>
+            {
+                skipped += 1;
+            }
+            Err(error) => {
+                failed += 1;
+                tracing::warn!(
+                    person = %person.xref,
+                    error = %error.1,
+                    "bulk biography generation failed"
+                );
+            }
+        }
+        processed += 1;
+        if let Err(error) = state.db.update_story_batch(
+            processed,
+            succeeded,
+            skipped,
+            failed,
+            None,
+            Some(&format!("Processed {processed} of {total} individuals")),
+        ) {
+            tracing::error!(%error, "updating bulk biography progress failed");
+        }
+    }
+    if let Err(error) = state.db.finish_story_batch(succeeded, skipped, failed) {
+        tracing::error!(%error, "finishing bulk biography job failed");
+    }
 }
 
 pub async fn discover_story_sources(
@@ -787,6 +1022,36 @@ async fn select_story_sources(
             .then_with(|| left.relative_path.cmp(&right.relative_path))
     });
     Ok(selected)
+}
+
+async fn load_confirmed_story_sources(
+    state: &AppState,
+    records: &Path,
+    identity: &PersonIdentity,
+) -> Result<Vec<story_sources::StorySource>> {
+    let links = state
+        .db
+        .transcript_person_links(&identity.stable_key())?
+        .into_iter()
+        .filter(|link| link.status == "confirmed")
+        .collect::<Vec<_>>();
+    let records_root = records.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let mut sources = Vec::new();
+        for link in links {
+            let Some(mut source) =
+                story_sources::read_transcript(&records_root, &link.transcript_path)?
+            else {
+                continue;
+            };
+            if source.transcript_sha256 == link.transcript_sha256 {
+                apply_persisted_link(&mut source, &link)?;
+                sources.push(source);
+            }
+        }
+        Ok::<_, anyhow::Error>(sources)
+    })
+    .await?
 }
 
 fn apply_persisted_link(

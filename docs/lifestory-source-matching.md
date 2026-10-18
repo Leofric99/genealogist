@@ -54,6 +54,13 @@ merging neighboring people or carrying a surname across columns/pages. The
 instructions are in `LIFE_STORY_REVIEW_PROMPT` in `src/web/handlers.rs`; the
 Settings prompt controls transcription, not biography review.
 
+For an individual biography, users may opt into an exact manual transcript
+selection. Duplicate path/hash entries are collapsed, the selected set becomes
+the confirmed set for that person, and previously confirmed but unselected
+transcripts are rejected for that transcript version. Bulk generation uses
+confirmed links only, skips people without any, and records progress in SQLite
+so the dashboard can resume polling after reconnecting.
+
 ## Confidence and citations
 
 Each Life Story section heading must be followed immediately by a line of the

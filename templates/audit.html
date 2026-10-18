@@ -25,7 +25,7 @@
     <p class="muted">Enter a GEDCOM individual identifier (for example, @I12@), find transcript candidates, and confirm the sources to use. Biographies use confirmed sources only; each factual line must cite a selected transcript.</p>
     <form @submit.prevent="story()">
       <label>Individual ID
-        <input type="text" x-model="personId" @change="storySources = []" placeholder="@I12@" required>
+        <input type="text" x-model="personId" @change="storySources = []; manualSourceSelection = false" placeholder="@I12@" required>
       </label>
       <label>Output location
         <select x-model="destination">
@@ -37,12 +37,26 @@
       <button type="submit" :disabled="busy">Generate biography</button>
     </form>
     <p class="muted" x-text="storyMessage"></p>
+    <div class="notice">
+      <p>Bulk generation uses confirmed transcript links only. People without confirmed sources are skipped; completed biographies are overwritten with the new version.</p>
+      <button type="button" @click="startStoryBatch()" :disabled="batchBusy || batchStatus.running">Generate all biographies</button>
+      <p class="muted" x-text="batchMessage"></p>
+      <p class="muted" x-show="batchStatus.running" x-text="`${batchStatus.processed}/${batchStatus.total} processed; ${batchStatus.succeeded} saved, ${batchStatus.skipped} skipped, ${batchStatus.failed} failed. ${batchStatus.active || ''}`"></p>
+    </div>
     <div x-show="storySources.length">
       <h3>Transcript-to-person mappings</h3>
       <p class="muted">New matches are suggestions and are not used in biographies until confirmed. Rejected links are excluded for this transcript version.</p>
+      <label>
+        <input type="checkbox" x-model="manualSourceSelection">
+        Use only the transcript files I select below
+      </label>
       <ul>
         <template x-for="source in storySources" :key="source.path">
           <li>
+            <label x-show="manualSourceSelection">
+              <input type="checkbox" x-model="source.selected" :disabled="busy">
+              Include in this biography
+            </label>
             <code x-text="source.path"></code>
             <span class="muted" x-text="`— ${source.evidence.join('; ')} (${Math.round(source.confidence * 100)}%, ${source.status})`"></span>
             <button type="button" @click="updateSource(source, 'confirm')" :disabled="busy || source.status === 'confirmed'">Confirm</button>
@@ -58,6 +72,41 @@ function auditPage() {
   return {
     busy: false, uploadMessage: "", message: "", result: "", anomalyCount: 0,
     personId: "", destination: "central", storyMessage: "", storySources: [],
+    manualSourceSelection: false, batchBusy: false, batchMessage: "",
+    batchStatus: { running: false, total: 0, processed: 0, succeeded: 0, skipped: 0, failed: 0, active: null },
+    init() {
+      this.loadBatchStatus().then(() => {
+        if (this.batchStatus.running) this.pollBatchStatus();
+      }).catch(error => { this.batchMessage = error.message; });
+    },
+    async loadBatchStatus() {
+      const response = await fetch("/api/stories/batch/status");
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || "Could not read bulk biography status");
+      this.batchStatus = data.status;
+    },
+    async pollBatchStatus() {
+      while (this.batchStatus.running) {
+        await new Promise(resolve => setTimeout(resolve, 1500));
+        try { await this.loadBatchStatus(); }
+        catch (error) { this.batchMessage = error.message; return; }
+      }
+      this.batchMessage = this.batchStatus.message || "";
+    },
+    async startStoryBatch() {
+      this.batchBusy = true; this.batchMessage = "Starting bulk biography generation…";
+      try {
+        const response = await fetch("/api/stories/batch", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ destination: this.destination })
+        });
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || "Could not start bulk biography generation");
+        this.batchStatus = data.status;
+        await this.pollBatchStatus();
+      } catch (error) { this.batchMessage = error.message; }
+      finally { this.batchBusy = false; }
+    },
     async discoverSources() {
       this.busy = true; this.storyMessage = "Finding transcript candidates…";
       this.storySources = [];
@@ -65,7 +114,11 @@ function auditPage() {
         const response = await fetch(`/api/story/${encodeURIComponent(this.personId)}/sources`);
         const data = await response.json();
         if (!response.ok) throw new Error(data.error || "Source discovery failed");
-        this.storySources = data.matched_sources || [];
+        this.storySources = (data.matched_sources || []).map(source => ({
+          ...source,
+          selected: source.status === "confirmed"
+        }));
+        this.manualSourceSelection = false;
         this.storyMessage = `Found ${this.storySources.length} transcript candidate(s) for ${data.person_name}. Confirm the sources to use in a biography.`;
       } catch (error) { this.storyMessage = error.message; }
       finally { this.busy = false; }
@@ -99,11 +152,23 @@ function auditPage() {
       try {
         const response = await fetch(`/api/story/${encodeURIComponent(this.personId)}`, {
           method: "POST", headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ destination: this.destination })
+          body: JSON.stringify({
+            destination: this.destination,
+            ...(this.manualSourceSelection ? {
+              selected_sources: this.storySources
+                .filter(source => source.selected)
+                .map(source => ({
+                  transcript_path: source.path,
+                  transcript_sha256: source.transcript_sha256
+                }))
+            } : {})
+          })
         });
         const data = await response.json();
         if (!response.ok) throw new Error(data.error || "Biography generation failed");
-        this.storySources = data.matched_sources || [];
+        this.storySources = (data.matched_sources || []).map(source => ({
+          ...source, selected: true
+        }));
         this.storyMessage = `Saved to ${data.path} using ${data.sources} transcript source(s).`;
       } catch (error) { this.storyMessage = error.message; }
       finally { this.busy = false; }
@@ -122,6 +187,7 @@ function auditPage() {
         const data = await response.json();
         if (!response.ok) throw new Error(data.error || "Source mapping update failed");
         source.status = data.status;
+        source.selected = data.status === "confirmed";
         this.storyMessage = `${source.path} is now ${data.status} for ${this.personId}.`;
       } catch (error) { this.storyMessage = error.message; }
       finally { this.busy = false; }

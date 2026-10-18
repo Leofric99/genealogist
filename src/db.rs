@@ -52,6 +52,18 @@ pub struct TranscriptPersonLink {
     pub evidence_json: String,
 }
 
+#[derive(Clone, Debug, Serialize)]
+pub struct StoryBatchStatus {
+    pub running: bool,
+    pub total: usize,
+    pub processed: usize,
+    pub succeeded: usize,
+    pub skipped: usize,
+    pub failed: usize,
+    pub active: Option<String>,
+    pub message: Option<String>,
+}
+
 impl Database {
     pub fn open(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
@@ -87,6 +99,18 @@ impl Database {
                  updated_at INTEGER NOT NULL,
                  PRIMARY KEY (person_key, transcript_path)
              );
+             CREATE TABLE IF NOT EXISTS story_batch (
+                 id INTEGER PRIMARY KEY CHECK (id = 1),
+                 running INTEGER NOT NULL DEFAULT 0,
+                 total INTEGER NOT NULL DEFAULT 0,
+                 processed INTEGER NOT NULL DEFAULT 0,
+                 succeeded INTEGER NOT NULL DEFAULT 0,
+                 skipped INTEGER NOT NULL DEFAULT 0,
+                 failed INTEGER NOT NULL DEFAULT 0,
+                 active TEXT,
+                 message TEXT
+             );
+             INSERT OR IGNORE INTO story_batch (id) VALUES (1);
              CREATE TABLE IF NOT EXISTS job (
                  id INTEGER PRIMARY KEY CHECK (id = 1),
                  running INTEGER NOT NULL DEFAULT 0,
@@ -97,6 +121,12 @@ impl Database {
                  message TEXT
              );
              INSERT OR IGNORE INTO job (id) VALUES (1);",
+        )?;
+        connection.execute(
+            "UPDATE story_batch SET running=0, active=NULL,
+             message=CASE WHEN running=1 THEN 'Batch interrupted by server restart' ELSE message END
+             WHERE id=1",
+            [],
         )?;
         connection.execute(
             "UPDATE settings SET value = ?1 WHERE key = 'system_prompt' AND value IN (?2, ?3, ?4, ?5)",
@@ -245,6 +275,107 @@ impl Database {
             params![status, now, person_key, transcript_path, transcript_sha256],
         )?;
         Ok(updated == 1)
+    }
+
+    pub fn replace_confirmed_transcript_person_links(
+        &self,
+        person_key: &str,
+        selected: &[(String, String)],
+    ) -> Result<()> {
+        let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        transaction.execute(
+            "UPDATE transcript_person_links
+             SET status='rejected', updated_at=?2
+             WHERE person_key=?1 AND status='confirmed'",
+            params![person_key, now],
+        )?;
+        for (path, hash) in selected {
+            let updated = transaction.execute(
+                "UPDATE transcript_person_links
+                 SET status='confirmed', updated_at=?3
+                 WHERE person_key=?1 AND transcript_path=?2 AND transcript_sha256=?4",
+                params![person_key, path, now, hash],
+            )?;
+            if updated != 1 {
+                anyhow::bail!("selected transcript mapping changed before it could be saved");
+            }
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn start_story_batch(&self, total: usize) -> Result<bool> {
+        let updated = self.connection()?.execute(
+            "UPDATE story_batch
+             SET running=1, total=?1, processed=0, succeeded=0, skipped=0, failed=0,
+                 active=NULL, message='Preparing biographies'
+             WHERE id=1 AND running=0",
+            [total],
+        )?;
+        Ok(updated == 1)
+    }
+
+    pub fn update_story_batch(
+        &self,
+        processed: usize,
+        succeeded: usize,
+        skipped: usize,
+        failed: usize,
+        active: Option<&str>,
+        message: Option<&str>,
+    ) -> Result<()> {
+        self.connection()?.execute(
+            "UPDATE story_batch
+             SET processed=?1, succeeded=?2, skipped=?3, failed=?4, active=?5, message=?6
+             WHERE id=1",
+            params![processed, succeeded, skipped, failed, active, message],
+        )?;
+        Ok(())
+    }
+
+    pub fn finish_story_batch(
+        &self,
+        succeeded: usize,
+        skipped: usize,
+        failed: usize,
+    ) -> Result<()> {
+        self.connection()?.execute(
+            "UPDATE story_batch
+             SET running=0, processed=total, succeeded=?1, skipped=?2, failed=?3,
+                 active=NULL, message=?4
+             WHERE id=1",
+            params![
+                succeeded,
+                skipped,
+                failed,
+                format!(
+                    "Bulk biographies complete: {succeeded} saved, {skipped} skipped, {failed} failed"
+                )
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn story_batch_status(&self) -> Result<StoryBatchStatus> {
+        Ok(self.connection()?.query_row(
+            "SELECT running, total, processed, succeeded, skipped, failed, active, message
+             FROM story_batch WHERE id=1",
+            [],
+            |row| {
+                Ok(StoryBatchStatus {
+                    running: row.get::<_, bool>(0)?,
+                    total: row.get(1)?,
+                    processed: row.get(2)?,
+                    succeeded: row.get(3)?,
+                    skipped: row.get(4)?,
+                    failed: row.get(5)?,
+                    active: row.get(6)?,
+                    message: row.get(7)?,
+                })
+            },
+        )?)
     }
 
     pub fn set_sidecar_settings(&self, mode: &str, folder: &str) -> Result<()> {
@@ -580,6 +711,74 @@ mod tests {
         let link = &links[0];
         assert_eq!(link.status, "suggested");
         assert_eq!(link.transcript_sha256, "b".repeat(64));
+    }
+
+    #[test]
+    fn manual_source_selection_replaces_confirmed_set_and_tracks_batch_progress() {
+        let directory = tempfile::tempdir().expect("temporary database directory");
+        let database =
+            Database::open(&directory.path().join("genealogy.sqlite3")).expect("open database");
+        for (path, hash) in [
+            ("records/selected.md", "a".repeat(64)),
+            ("records/omitted.md", "b".repeat(64)),
+        ] {
+            database
+                .suggest_transcript_person_link(
+                    "person-key",
+                    "@I1@",
+                    "Ada Example",
+                    path,
+                    &hash,
+                    0.8,
+                    "[]",
+                )
+                .expect("save source suggestion");
+            assert!(database
+                .set_transcript_person_link_status("person-key", path, &hash, "confirmed")
+                .expect("confirm source"));
+        }
+
+        database
+            .replace_confirmed_transcript_person_links(
+                "person-key",
+                &[("records/selected.md".to_owned(), "a".repeat(64))],
+            )
+            .expect("replace confirmed source set");
+        let links = database.transcript_person_links("person-key").unwrap();
+        assert_eq!(
+            links
+                .iter()
+                .find(|link| link.transcript_path == "records/selected.md")
+                .unwrap()
+                .status,
+            "confirmed"
+        );
+        assert_eq!(
+            links
+                .iter()
+                .find(|link| link.transcript_path == "records/omitted.md")
+                .unwrap()
+                .status,
+            "rejected"
+        );
+
+        assert!(database.start_story_batch(4).expect("start batch"));
+        assert!(!database
+            .start_story_batch(4)
+            .expect("prevent duplicate batch"));
+        database
+            .update_story_batch(1, 1, 0, 0, Some("@I1@"), Some("Generating"))
+            .expect("update batch progress");
+        let status = database.story_batch_status().expect("read batch status");
+        assert!(status.running);
+        assert_eq!(status.processed, 1);
+        assert_eq!(status.active.as_deref(), Some("@I1@"));
+        database.finish_story_batch(2, 1, 1).expect("finish batch");
+        let status = database.story_batch_status().expect("read final status");
+        assert!(!status.running);
+        assert_eq!(status.succeeded, 2);
+        assert_eq!(status.skipped, 1);
+        assert_eq!(status.failed, 1);
     }
 
     #[test]

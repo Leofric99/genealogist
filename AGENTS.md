@@ -31,8 +31,12 @@
   rejected transcript-person links, keyed by GEDCOM identity, relative path,
   and transcript hash. A transcript content change must reset an old review
   decision to suggested. Only confirmed links are trusted as user-reviewed
-  selections, but all generated biography claims still require transcript
-  citations and validation by `src/web/story_format.rs`.
+  selections. A manual per-biography source set is authoritative: deduplicate
+  it, confirm its members, and reject other previously confirmed links for that
+  person. Bulk biography generation uses confirmed links only, skips people
+  without any, records progress in SQLite, and overwrites stable output paths.
+  All generated biography claims still require transcript citations and
+  validation by `src/web/story_format.rs`.
 - Keep the image-only `GENESLEUTH_NON_DOCUMENT` response invariant appended to
   custom prompts. Handle it as a permanent `filtered` result before writing a
   transcript; PDFs must never use this sentinel.

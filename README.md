@@ -123,7 +123,10 @@ PUID=$(id -u) PGID=$(id -g) docker compose up --build
    example, `@I12@`) and find transcript sources. Review the suggested matches
    and confirm only those that belong to the person; biographies use confirmed
    sources only. Choose a central stories folder or a person-specific subfolder,
-   then verify each claim against the original record.
+   or manually select the exact transcript set for that biography. Generating
+   the biography again overwrites its previous file. Use **Generate all
+   biographies** to process every GEDCOM person with confirmed transcript
+   sources; people without confirmed sources are skipped.
 7. **Repeat as your research grows.** Add new scans and start another directory
    scan; unchanged, successfully handled files are skipped. Files that failed
    remain marked as errors and are retried on a later scan. **Clear indexed
@@ -174,6 +177,10 @@ PUID=$(id -u) PGID=$(id -g) docker compose up --build
   carrying forward an old confirmation. Only confirmed links are included in a
   generated biography. Names and filenames are discovery clues, not proof of
   identity; verify biographical claims against their cited transcriptions.
+  Manually selecting transcript files for an individual makes that selection
+  authoritative: duplicates are collapsed and previously confirmed files not
+  selected are rejected for that transcript version. Bulk generation uses
+  these confirmed links and reports saved, skipped, and failed biographies.
 - API keys are encrypted in SQLite using a local encryption key. Back up the
   `.encryption-key` file along with the database; alternatively supply a stable
   64-hex-character `GOS_MASTER_KEY`.

@@ -146,6 +146,11 @@ async fn serve() -> Result<()> {
             get(web::handlers::discover_story_sources)
                 .post(web::handlers::update_story_source_link),
         )
+        .route("/api/stories/batch", post(web::handlers::start_story_batch))
+        .route(
+            "/api/stories/batch/status",
+            get(web::handlers::story_batch_status),
+        )
         .layer(RequestBodyLimitLayer::new(25 * 1024 * 1024))
         .layer(middleware::from_fn_with_state(
             Arc::clone(&state),
