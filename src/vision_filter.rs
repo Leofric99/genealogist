@@ -77,15 +77,32 @@ fn score_gray(gray: &GrayImage) -> VisionScore {
         })
         .count();
     let line_ratio = horizontal_line_rows as f64 / gray.height().max(1) as f64;
-    let likely_document = edge_density > 0.006
+    let likely_document = (edge_density > 0.006
         && variance > 0.035
         && bimodal_fraction > 0.25
-        && (line_ratio > 0.015 || edge_density > 0.018);
+        && (line_ratio > 0.015 || edge_density > 0.018))
+        || is_dense_high_contrast_scan(edge_density, bimodal_fraction);
     VisionScore {
         edge_density,
         normalized_variance: variance,
         bimodal_fraction,
         horizontal_line_rows,
         likely_document,
+    }
+}
+
+fn is_dense_high_contrast_scan(edge_density: f64, bimodal_fraction: f64) -> bool {
+    edge_density > 0.02 && bimodal_fraction > 0.85
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_dense_high_contrast_scan;
+
+    #[test]
+    fn dense_high_contrast_census_scan_bypasses_native_photo_filter() {
+        assert!(is_dense_high_contrast_scan(0.028, 0.9537));
+        assert!(!is_dense_high_contrast_scan(0.01, 0.9537));
+        assert!(!is_dense_high_contrast_scan(0.028, 0.75));
     }
 }
