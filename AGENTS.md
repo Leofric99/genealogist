@@ -21,15 +21,27 @@
 - Keep the default transcription prompt format-agnostic. Its table guidance
   should preserve source row/column relationships, require consistent cell
   counts, and use compact Markdown separators rather than content-width padding.
-  Keep headings/instructions separate from table values; handle ditto surname
-  continuation and side-by-side index blocks explicitly without over-inference.
+  Keep headings/instructions separate from table values; preserve ditto marks
+  literally in Markdown and leave their expansion to structured extraction.
+  JSON extraction must resolve only clear same-column ditto values within one
+  table, keep the original marker in its evidence quote, and record the result
+  as inferred. Keep side-by-side index blocks explicitly separated.
 - When changing the built-in prompt, migrate only an exact match of the prior
   built-in text so saved custom prompts remain untouched.
-- Run structured extraction as a separate Gemini call after transcription,
-  using the Markdown transcript as input. Keep source labels and values,
+- Run structured extraction as separate Gemini calls after transcription,
+  using bounded Markdown chunks. Keep source labels and values,
   require exact transcript evidence for each fact, and leave ambiguous person
-  matches unresolved. Existing audit and Life Story consumers must read JSON
+  matches unresolved. Split Markdown tables into bounded row batches, require
+  explicit row accounting and 1-based source row/column mappings, and reject a
+  batch unless every populated cell is represented by a person name or fact.
+  Preserve relationship direction for subjects and named relatives. Schema
+  upgrades must make old companions
+  eligible for metadata-only regeneration without retranscribing unchanged
+  source files. Existing audit and Life Story consumers must read JSON
   companions while retaining compatibility with legacy YAML-frontmatter files.
+- Keep the image-only `GENESLEUTH_NON_DOCUMENT` response invariant appended to
+  custom prompts. Handle it as a permanent `filtered` result before writing a
+  transcript or attempting JSON extraction; PDFs must never use this sentinel.
 - Life story source matching lives in `src/web/story_sources.rs`; keep fuzzy
   name matches dependent on independent GEDCOM/transcript/path corroboration.
   `src/web/story_format.rs` validates per-section confidence and transcript

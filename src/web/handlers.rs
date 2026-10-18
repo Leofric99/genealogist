@@ -35,6 +35,8 @@ Read tables, columns, headings, page breaks, ditto marks, braces, indentation an
 
 Compare names alongside dates, ages, places, relationships, occupations and record context. OCR spelling similarity alone does not prove identity. Use the provided heuristic match clues only as leads; confirm them against the transcription and GEDCOM, and state when identity or surname expansion remains uncertain. Resolve no conflict by silently choosing one version: cite the competing evidence and explain the uncertainty.
 
+Relationship labels such as Father, Mother, spouse, witness, or informant describe that person's relationship to the record subject; they do not make that person the subject of the recorded event. Keep the relationship direction explicit. For example, a child's baptism date belongs to the child, while the named father is evidence of parentage. Do not transfer the child's birth, age, or event facts to a parent, and do not confuse a relative with the requested person.
+
 Write a clear chronological biography using only supported facts. Use Markdown section headings (## or deeper). Immediately after every section heading, with no blank line between, put a line formatted exactly **Confidence: NN%**. This is a qualitative estimate of how strongly the cited evidence supports that section, not statistical certainty. Cite every historical or biographical claim with an inline Markdown link to one or more allowed transcript files, using exactly the relative paths supplied. Put each factual sentence or list item on its own line and cite it on that same line; do not leave factual introductory or concluding text uncited. Include a Sources section whose entries link to cited transcripts. Return only the biography."#;
 
 #[derive(Serialize)]

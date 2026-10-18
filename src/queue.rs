@@ -294,6 +294,14 @@ async fn process_one(
             .await
         {
             Ok(transcript) => transcript,
+            Err(error) if crate::gemini_client::is_non_document(&error) => {
+                let reason = "Gemini transcription safeguard classified this image as a non-document; no transcript or JSON was created.".to_owned();
+                state
+                    .db
+                    .save_file(&source, &file.sha256, "filtered", None, Some(&reason))?;
+                info!(path = %path.display(), "Gemini transcription safeguard skipped non-document image");
+                return Ok(ProcessResult::Skipped(reason));
+            }
             Err(error) if crate::gemini_client::is_no_candidate_text(&error) => {
                 return save_empty_image(state, &source, &file.sha256).map(|()| {
                     ProcessResult::Skipped("Gemini returned no text for this image".to_owned())

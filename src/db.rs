@@ -14,6 +14,8 @@ use std::{
 
 const PRE_METADATA_PROMPT_SHA256: &str =
     "798f051cfd905879abf27cd6df18c2baf817f25e6ef21c4616afe3b155132674";
+const PRE_DITTO_PROMPT_SHA256: &str =
+    "729d982d4e4490322125dcdddc588c36f3d1d5ebd8025c36d66608dbc689993e";
 
 pub struct Database {
     connection: Mutex<Connection>,
@@ -87,9 +89,10 @@ impl Database {
                 |row| row.get(0),
             )
             .optional()?;
-        // Fingerprint of the immediately previous built-in prompt; custom text is not migrated.
+        // Fingerprints of prior built-in prompts; custom text is not migrated.
         if stored_prompt.as_deref().is_some_and(|prompt| {
-            hex::encode(Sha256::digest(prompt.as_bytes())) == PRE_METADATA_PROMPT_SHA256
+            let fingerprint = hex::encode(Sha256::digest(prompt.as_bytes()));
+            fingerprint == PRE_METADATA_PROMPT_SHA256 || fingerprint == PRE_DITTO_PROMPT_SHA256
         }) {
             connection.execute(
                 "UPDATE settings SET value = ?1 WHERE key = 'system_prompt'",

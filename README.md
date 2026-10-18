@@ -114,7 +114,10 @@ PUID=$(id -u) PGID=$(id -g) docker compose up --build
    The Markdown body is the authoritative transcription; a separate `.json`
    file beside it contains AI-extracted person mentions and evidence-backed
    facts. If you edit a transcript, the next scan regenerates its JSON from the
-   edited Markdown without retranscribing an unchanged source image.
+   edited Markdown without retranscribing an unchanged source image. Long
+   Markdown tables are extracted in small row batches; every populated table
+   cell must be accounted for before the JSON is saved. If a batch is incomplete,
+   the app retries it once and leaves extraction pending if it still fails.
 5. **Upload your GEDCOM and audit the evidence.** On **GEDCOM audit**, upload
    your `.ged` file, then run the audit. Review timeline, identity, and
    location findings as leads rather than proven errors; the report is saved
@@ -165,11 +168,22 @@ PUID=$(id -u) PGID=$(id -g) docker compose up --build
   empty cells, and source order without assuming a particular document type.
   It explicitly separates multi-level column headings and printed form
   instructions from table data, asks for one row per person on census-style
-  schedules, handles ditto surnames and side-by-side index blocks, and excludes
-  website controls from digitized record screenshots. Existing exact copies of
-  previous built-in prompts are upgraded on startup; custom prompts are left
-  unchanged. Older YAML-frontmatter transcripts remain readable by audit and
-  source-matching features.
+  schedules, preserves ditto marks exactly, and excludes website controls from
+  digitized record screenshots. A mandatory image-only safeguard instructs
+  Gemini to return a structured non-document marker for clear photographs and
+  artwork; those images are saved as `filtered` without Markdown/JSON or later
+  retries unless their source changes. Existing exact copies of previous
+  built-in prompts are upgraded on startup; custom prompts are left unchanged.
+  Older YAML-frontmatter transcripts remain readable by audit and source
+  matching features.
+- Structured transcript JSON uses schema version 1.2. On the next scan, older
+  JSON companions are regenerated with row-level coverage and source-column
+  checks while their Markdown transcripts remain untouched. Ditto marks in
+  table cells are expanded in JSON only, by carrying the nearest preceding
+  non-ditto value in that same column and table. Original marker text remains
+  unchanged in the evidence quote, and ditto-derived values are explicitly
+  marked as inferred. Person and relative mentions retain explicit relationship
+  direction so a child's event facts are not assigned to a parent.
 - API keys are encrypted in SQLite using a local encryption key. Back up the
   `.encryption-key` file along with the database; alternatively supply a stable
   64-hex-character `GOS_MASTER_KEY`.
