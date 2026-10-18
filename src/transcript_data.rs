@@ -501,12 +501,12 @@ pub fn parse_extraction_for_rows(
         .unwrap_or_else(|| raw.trim());
     let mut payload: ExtractionPayload =
         serde_json::from_str(json).context("Gemini returned invalid transcript JSON")?;
-    resolve_payload_ditto_values(&mut payload, source_rows)?;
+    normalize_payload_before_validation(&mut payload, source_rows)?;
     validate_payload(&payload, transcript, source_rows)?;
     Ok(payload)
 }
 
-fn resolve_payload_ditto_values(
+fn normalize_payload_before_validation(
     payload: &mut ExtractionPayload,
     source_rows: &[ExtractionSourceRow],
 ) -> Result<()> {
@@ -514,6 +514,20 @@ fn resolve_payload_ditto_values(
         return Ok(());
     }
     for person in &mut payload.person_mentions {
+        for row_id in person.name_source_row_id.iter().chain(
+            person
+                .facts
+                .iter()
+                .filter_map(|fact| fact.source_row_id.as_ref()),
+        ) {
+            if !person
+                .source_row_ids
+                .iter()
+                .any(|assigned| assigned == row_id)
+            {
+                person.source_row_ids.push(row_id.clone());
+            }
+        }
         if let (Some(row_id), Some(column_index)) = (
             person.name_source_row_id.as_deref(),
             person.name_source_column_index,
@@ -1487,6 +1501,65 @@ mod tests {
 
         assert_eq!(rows[0].resolved_cells, vec![None, None]);
         assert_eq!(rows[1].resolved_cells, vec![None, None]);
+    }
+
+    #[test]
+    fn source_row_mappings_repair_an_omitted_person_row_assignment() {
+        let transcript =
+            "| Name | Record detail |\n| --- | --- |\n| Arthur | 5 |\n| John | Father of Arthur |\n";
+        let chunk = extraction_chunks(transcript).remove(0);
+        let first_row = &chunk.source_rows[0].id;
+        let second_row = &chunk.source_rows[1].id;
+        let output = serde_json::json!({
+            "document_type": "register",
+            "person_mentions": [
+                {
+                    "name_as_written": "Arthur",
+                    "source_row_ids": [first_row],
+                    "name_evidence": { "quote": "Arthur", "location": "row 1, name" },
+                    "name_source_row_id": first_row,
+                    "name_source_column_index": 1,
+                    "facts": [
+                        {
+                            "label": "Age", "value": "5",
+                            "source_row_id": first_row, "source_column_index": 2,
+                            "evidence": { "quote": "5", "location": "row 1, detail" }
+                        },
+                        {
+                            "label": "Father", "value": "John",
+                            "source_row_id": second_row, "source_column_index": 1,
+                            "evidence": { "quote": "John", "location": "row 2, name" }
+                        }
+                    ]
+                },
+                {
+                    "name_as_written": "John",
+                    "source_row_ids": [second_row],
+                    "name_evidence": { "quote": "John", "location": "row 2, name" },
+                    "name_source_row_id": second_row,
+                    "name_source_column_index": 1,
+                    "facts": [{
+                        "label": "Relationship to Arthur", "value": "Father of Arthur",
+                        "source_row_id": second_row, "source_column_index": 2,
+                        "evidence": {
+                            "quote": "Father of Arthur",
+                            "location": "row 2, detail"
+                        }
+                    }]
+                }
+            ],
+            "non_person_source_row_ids": []
+        });
+        let payload =
+            parse_extraction_for_rows(&output.to_string(), transcript, &chunk.source_rows)
+                .expect("source mappings repair the omitted row assignment");
+        let metadata = build_metadata(payload, "baptism.png", &"a".repeat(64), transcript)
+            .expect("valid mapped metadata");
+
+        assert_eq!(
+            metadata.person_mentions[0].source_row_ids,
+            vec![first_row.clone(), second_row.clone()]
+        );
     }
 
     #[test]
